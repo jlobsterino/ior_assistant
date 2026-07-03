@@ -1,0 +1,40 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>ИОР-помощник — Audit Intelligence</title>
+
+    <!-- Локальные шрифты IBM Plex (offline для prod) -->
+    <link rel="stylesheet" href="assets/fonts/fonts.css" />
+
+    <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+    <div id="root"></div>
+
+    <script>
+        // Tweak defaults (edited by host on persist) – kept simple, valid JSON
+        window.__IOR_DEFAULTS = /*EDITMODE-BEGIN*/{
+            "accent": "emerald",
+            "dark": false,
+            "density": "regular",
+            "statsStyle": "cards",
+            "sseStyle": "timeline",
+            "excelStyle": "preview"
+        }/*EDITMODE-END*/;
+    </script>
+
+    <!-- Локальные vendor-библиотеки (offline для prod) -->
+    <script src="vendor/react.production.min.js"></script>
+    <script src="vendor/react-dom.production.min.js"></script>
+    <script src="vendor/babel.min.js"></script>
+
+    <script type="text/babel" src="tweaks-panel.jsx"></script>
+    <script type="text/babel" src="data.jsx"></script>
+    <script type="text/babel" src="messages.jsx"></script>
+    <script type="text/babel" src="skills-modal.jsx"></script>
+    <script type="text/babel" src="credit-form.jsx"></script>
+    <script type="text/babel" src="ior-app.jsx"></script>
+</body>
+</html>

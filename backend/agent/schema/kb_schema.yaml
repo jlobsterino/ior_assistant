@@ -1,0 +1,266 @@
+# Auto-generated schema БЗ ИОР для Planner'а агента.
+# Сгенерировано scripts/refresh_schema.py из реальной БД.
+# Колонки/типы - авто из DESCRIBE. foreign_keys/description/
+# enum_values - курируемые вручную, сохраняются при re-run.
+
+tables:
+  d6_base_of_knowledge_incident_fin_impact:
+    full_name: arnsdpsbx_t_team_sva_oarb_4.d6_base_of_knowledge_incident_fin_impact
+    description: Таблица d6_base_of_knowledge_incident_fin_impact (авто)
+    row_count: 0
+    columns:
+    - name: incdnt_id
+      type: bigint
+    - name: fin_impact_id
+      type: bigint
+    - name: fin_impact_type_name
+      type: varchar
+    - name: fin_impact_sid
+      type: varchar
+    - name: fin_impact_rub_amt
+      type: double
+    - name: fin_impact_local_crncy_code
+      type: varchar
+    - name: fin_impact_detection_dt
+      type: timestamp_ns
+    - name: fin_impact_creation_dttm
+      type: timestamp_ns
+    - name: fin_impact_account_num
+      type: varchar
+    - name: fin_impact_docum_num
+      type: varchar
+    - name: fin_impact_reg_dt
+      type: timestamp_ns
+    - name: fin_impact_crncy_code
+      type: varchar
+    - name: fin_impact_kind_name
+      type: varchar
+    - name: fin_impact_monitoring_flag
+      type: varchar
+    - name: fin_impact_local_ccy_amt
+      type: double
+    - name: fin_impact_ccy_amt
+      type: double
+    - name: fi_busn_area_id
+      type: integer
+    - name: fi_org_struct_id
+      type: integer
+    foreign_keys:
+    - column: incdnt_id
+      references: d6_base_of_knowledge_ior.incdnt_id
+  d6_base_of_knowledge_incident_nonfin_impact:
+    full_name: arnsdpsbx_t_team_sva_oarb_4.d6_base_of_knowledge_incident_nonfin_impact
+    description: Таблица d6_base_of_knowledge_incident_nonfin_impact (авто)
+    row_count: 0
+    columns:
+    - name: incdnt_id
+      type: bigint
+    - name: nonfin_impact_sid
+      type: varchar
+    - name: nonfin_impact_kind_name
+      type: varchar
+    - name: nonfin_impact_influence_class_name
+      type: varchar
+    foreign_keys:
+    - column: incdnt_id
+      references: d6_base_of_knowledge_ior.incdnt_id
+  d6_base_of_knowledge_incident_recovery:
+    full_name: arnsdpsbx_t_team_sva_oarb_4.d6_base_of_knowledge_incident_recovery
+    description: Таблица d6_base_of_knowledge_incident_recovery (авто)
+    row_count: 0
+    columns:
+    - name: incdnt_id
+      type: bigint
+    - name: recovery_sid
+      type: varchar
+    - name: recovery_type_name
+      type: varchar
+    - name: recovery_local_crncy_code
+      type: varchar
+    - name: recovery_src_account_num
+      type: varchar
+    - name: recovery_doc_num
+      type: varchar
+    - name: recovery_crncy_code
+      type: varchar
+    - name: recovery_creation_dttm
+      type: timestamp_ns
+    - name: recovery_reg_dt
+      type: timestamp_ns
+    - name: recovery_ccy_amt
+      type: double
+    - name: recovery_rub_amt
+      type: double
+    - name: recovery_local_ccy_amt
+      type: double
+    foreign_keys:
+    - column: incdnt_id
+      references: d6_base_of_knowledge_ior.incdnt_id
+  d6_base_of_knowledge_incident_stts_chng:
+    full_name: arnsdpsbx_t_team_sva_oarb_4.d6_base_of_knowledge_incident_stts_chng
+    description: Таблица d6_base_of_knowledge_incident_stts_chng (авто)
+    row_count: 0
+    columns:
+    - name: stts_chng_action_code
+      type: varchar
+    - name: incdnt_id
+      type: bigint
+    - name: incdnt_status_name
+      type: varchar
+    - name: incdnt_status_code
+      type: varchar
+    - name: stts_chng_action_name
+      type: varchar
+    - name: stts_chng_comment_txt
+      type: varchar
+    - name: stts_chng_action_dttm
+      type: timestamp_ns
+    - name: stts_chng_user_num
+      type: varchar
+    - name: start_dt
+      type: timestamp_ns
+    foreign_keys:
+    - column: incdnt_id
+      references: d6_base_of_knowledge_ior.incdnt_id
+  d6_base_of_knowledge_ior:
+    full_name: arnsdpsbx_t_team_sva_oarb_4.d6_base_of_knowledge_ior
+    description: Таблица d6_base_of_knowledge_ior (авто)
+    row_count: 10000
+    columns:
+    - name: incdnt_sid
+      type: varchar
+    - name: incdnt_id
+      type: bigint
+    - name: incdnt_status_name
+      type: varchar
+    - name: incdnt_autoreg_flag
+      type: varchar
+    - name: incdnt_detection_person_name
+      type: varchar
+    - name: incdnt_source_name
+      type: varchar
+    - name: src_type_lvl_1_name
+      type: varchar
+    - name: src_type_lvl_2_name
+      type: varchar
+    - name: incdnt_type_lvl_1_name
+      type: varchar
+    - name: incdnt_type_lvl_2_name
+      type: varchar
+    - name: incdnt_detection_dt
+      type: timestamp_ns
+    - name: incdnt_start_dt
+      type: timestamp_ns
+    - name: incdnt_entry_dt
+      type: timestamp_ns
+    - name: incdnt_first_validated_dttm
+      type: timestamp_ns
+    - name: incdnt_last_validate_dttm
+      type: timestamp_ns
+    - name: risk_profile_id
+      type: varchar
+    - name: risk_profile_name
+      type: varchar
+    - name: incdnt_client_type_name
+      type: varchar
+    - name: incdnt_mistake_cnt
+      type: bigint
+    - name: incdnt_appl_num
+      type: varchar
+    - name: incdnt_agr_num
+      type: varchar
+    - name: incdnt_agr_sid
+      type: varchar
+    - name: incdnt_summary_descr_txt
+      type: varchar
+    - name: incdnt_full_descr_txt
+      type: varchar
+    - name: org_struct_id
+      type: varchar
+    - name: org_struct_lvl_2_name
+      type: varchar
+    - name: org_struct_lvl_3_name
+      type: varchar
+      filled_pct: 97.0
+    - name: org_struct_lvl_4_name
+      type: varchar
+    - name: org_struct_lvl_5_name
+      type: varchar
+    - name: org_struct_lvl_6_name
+      type: varchar
+    - name: org_struct_lvl_7_name
+      type: varchar
+    - name: org_struct_lvl_8_name
+      type: integer
+    - name: org_struct_lvl_9_name
+      type: integer
+    - name: org_struct_lvl_10_name
+      type: integer
+    - name: funct_block_id
+      type: varchar
+    - name: funct_block_lvl_2_name
+      type: varchar
+    - name: funct_block_lvl_3_name
+      type: varchar
+    - name: funct_block_lvl_4_name
+      type: varchar
+    - name: process_lvl_1_name
+      type: varchar
+    - name: process_lvl_2_name
+      type: varchar
+    - name: process_lvl_3_name
+      type: varchar
+    - name: process_lvl_4_name
+      type: varchar
+    - name: clntpth_lvl_4_name
+      type: varchar
+    - name: busn_area_id
+      type: varchar
+    - name: busn_area_lvl_1_name
+      type: varchar
+    - name: busn_area_lvl_2_name
+      type: varchar
+    - name: incdnt_security_risk_flag
+      type: boolean
+    - name: incdnt_infrmtn_sys_risk_flag
+      type: boolean
+    - name: incdnt_behavior_risk_flag
+      type: boolean
+    - name: incdnt_model_risk_flag
+      type: boolean
+    - name: incdnt_sum
+      type: double
+      filled_pct: 2.26
+    - name: incdnt_drct_dmg_sum
+      type: double
+      filled_pct: 2.26
+    - name: incdnt_drct_dmg_cred_rub_amt
+      type: double
+    - name: incdnt_drct_dmg_noncred_rub_amt
+      type: double
+    - name: incdnt_indrct_dmg_sum
+      type: double
+    - name: incdnt_indrct_dmg_cred_rub_amt
+      type: double
+    - name: incdnt_indrct_dmg_noncred_rub_amt
+      type: double
+    - name: incdnt_unrlzd_dmg_sum
+      type: double
+    - name: incdnt_unrlzd_dmg_cred_rub_amt
+      type: bigint
+    - name: incdnt_unrlzd_dmg_noncred_rub_amt
+      type: double
+    - name: incdnt_thrd_prt_dmg_sum
+      type: double
+    - name: incdnt_thrd_prt_cred_rub_amt
+      type: bigint
+    - name: incdnt_thrd_prt_noncred_rub_amt
+      type: double
+    - name: incdnt_gain_sum
+      type: double
+    - name: incdnt_gain_cred_rub_amt
+      type: bigint
+    - name: incdnt_gain_noncred_rub_amt
+      type: double
+    - name: recovery_rub_amt
+      type: double

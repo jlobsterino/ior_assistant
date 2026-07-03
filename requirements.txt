@@ -1,0 +1,37 @@
+# Core
+fastapi>=0.111.0
+uvicorn[standard]>=0.29.0
+gunicorn>=22.0.0
+pydantic>=2.7.0
+pydantic-settings>=2.2.0
+python-dotenv>=1.0.0
+python-multipart>=0.0.9
+
+# LLM (GigaChat - прямой HTTP-клиент, без langchain)
+# Прямой httpx-клиент к /v1/chat/completions (OpenAI-compatible).
+# langchain-gigachat НЕ используем - он в DataLab на Python 3.12
+# тянет несовместимую версию langchain_protocol.
+httpx>=0.27.0
+
+# Storage
+sqlalchemy>=2.0.30
+aiosqlite>=0.20.0
+
+# Notebook + Excel
+# Papermill запускает .ipynb в чистом ipykernel-subprocess.
+# Это стабильнее in-process exec() для Spark в DataLab + Python 3.12.
+papermill>=2.6.0
+ipykernel>=6.29.0
+nbformat>=5.10.0
+openpyxl>=3.1.0
+xlsxwriter>=3.2.0
+pyarrow>=14.0.0
+pandas>=2.2.0,<3.0
+
+# Utilities
+watchdog>=4.0.0
+pyyaml>=6.0
+duckdb>=0.10.0
+
+# PySpark
+pyspark==3.5.1

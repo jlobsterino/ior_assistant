@@ -1,0 +1,35 @@
+# -----------------------------------------------------------------
+# ИОР-помощник - docker-compose для prod-деплоя
+# Использование: docker compose up -d
+# -----------------------------------------------------------------
+version: "3.9"
+
+services:
+  ior-assistant:
+    build: .
+    image: ior-assistant:latest
+    container_name: ior-assistant
+    restart: unless-stopped
+    ports:
+      - "${APP_PORT:-8000}:8000"
+    env_file:
+      - .env
+    environment:
+      APP_ENV: prod
+      APP_HOST: 0.0.0.0
+      APP_PORT: 8000
+    volumes:
+      - ior_data:/app/data
+      - ior_logs:/app/logs
+      # При желании пробросить knowledge_base снаружи:
+      # - ./knowledge_base:/app/knowledge_base:ro
+    healthcheck:
+      test: ["CMD", "curl", "-fs5", "http://localhost:8000/api/health/detail"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
+
+volumes:
+  ior_data:
+  ior_logs:
