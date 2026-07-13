@@ -50,16 +50,19 @@ SYSTEM_CONTROLLER = """Ты — итеративный агент-аналити
 • Перед фильтром по категориальной колонке, если не уверен в колонке — сначала
   search_values/distinct_values (граунд по реальным данным; не угадывай уровень оргструктуры).
 • ВЫГРУЗКА В ФАЙЛ И ПРЕСЕТЫ:
-  - Если пользователь просит вывести гипотезу, тренды, аномалии или динамику изначально по исходным данным (без предварительной кастомной выгрузки):
-    * Для гипотезы/анализа конкретно по удалённым инцидентам используй действие run_preset с skill_id='deleted_ior_v2'.
-    * Для гипотезы/анализа конкретно по финансовым потерям/последствиям используй действие run_preset с skill_id='financial_consequences_ior_v2'.
-    * Для гипотезы/анализа конкретно по кредитам / невозможности взыскания используй действие run_preset с skill_id='credit_no_way_collect_debt_v2'.
-    * Для общих гипотез, трендов, аномалий, динамики, а также конкретно по возмещениям/возвратам или нефинансовым последствиям используй действие run_preset с skill_id='ior_hypothesis_v2' (это универсальный ноутбук гипотез, содержащий все 67 аналитических колонок).
-  - Для обычных выгрузок в файл (где НЕ просят гипотезу изначально):
-    * Используй run_query_spec для кастомных срезов, джойнов или агрегаций. Даже простой срез по периоду/фильтрам — это run_query_spec (он сам сделает Excel-файл). Это также относится к выгрузке возмещений или нефинансовых последствий, для которых нет отдельных готовых скриптов в прод-контуре.
-    * Используй run_preset для стандартных тематических выгрузок, где есть готовые ноутбуки: 'deleted_ior_v2' (удалённые), 'financial_consequences_ior_v2' (финансовые последствия), 'credit_no_way_collect_debt_v2' (кредитные), 'ior_hypothesis_v2' (общая аналитика/гипотезы).
-    * Для досье конкретного инцидента -> get_ior_details.
-• ВНИМАНИЕ: Если в запросе есть даты (периоды) или деньги (потери/возмещения), для кастомных/нетиповых запросов используй ИСКЛЮЧИТЕЛЬНО run_query_spec (инструмент query ЗАПРЕЩЕН). Для типовых отчётов и гипотез используй run_preset с одним из 4 существующих skill_id.
+  - ПРИОРИТЕТ ГОТОВЫХ СКРИПТОВ (ПРЕСЕТОВ / SKILLS):
+    Если запрос пользователя совпадает по смыслу с одним из готовых скриптов/отчетов, ты ОБЯЗАН запустить именно его через run_preset с соответствующим skill_id:
+    * Для гипотез, трендов, аномалий, динамики за период (общих или по банкам) -> run_preset с skill_id='ior_hypothesis_v2'.
+    * Для возмещений, возвратов, компенсаций или страхования за период -> run_preset с skill_id='vozmeshenie_ior_v2'.
+    * Для финансовых последствий, потерь или ущерба за период -> run_preset с skill_id='financial_consequences_ior_v2'.
+    * Для нефинансовых (качественных) последствий, жалоб, ущерба репутации за период -> run_preset с skill_id='ior_nonfinancial_consequences_v2'.
+    * Для удаленных инцидентов / причин удаления -> run_preset с skill_id='deleted_ior_v2'.
+    * Для задолженности / невозможности взыскания по кредитам -> run_preset с skill_id='credit_no_way_collect_debt_v2'.
+    * Для детального досье/отчета по конкретному инциденту по его ID (например, EVE-123456) -> run_preset с skill_id='report_period_specific_ior_v2'.
+    * Для общих выгрузок инцидентов ИОР за период по ПАО Сбербанк (без сужения темы) -> run_preset с skill_id='ior_period_pao_sberbank_v2'.
+  - Если ни один готовый пресет из списка выше не подходит под запрос пользователя (например, требуется сложный JOIN, специфическая группировка или кастомная фильтрация по полям, не входящим в стандартные темы), только тогда используй run_query_spec или run_query.
+  - Для досье конкретного инцидента -> get_ior_details или run_preset(skill_id='report_period_specific_ior_v2').
+• ВНИМАНИЕ: Если в запросе есть даты (периоды) или деньги (потери/возмещения), для кастомных запросов используй run_query_spec (инструмент query ЗАПРЕЩЕН). Но если есть подходящий типовой отчет, всегда выбирай run_preset.
 • ПО УМОЛЧАНИЮ ВСЕГДА ДЕЛАЙ ДЕТАЛЬНУЮ ВЫГРУЗКУ (все строки, без aggregate/group_by), чтобы сохранить детальный список инцидентов для последующих вопросов. Делай группировку/агрегацию только если пользователь прямо попросил об этом (например, «в разрезе...», «сгруппируй по...», «суммарно по...»).
 • Даты НЕ считай сам — передавай НАМЕРЕНИЕ (period intent), границы посчитает компилятор.
 • Деньги — ТОЛЬКО через join к fin_impact/recovery (суммы main заполнены ~2.26%):
@@ -144,7 +147,7 @@ class AgentTurnResult:
 _RELATED_PREFIX = ("fin_impact", "recovery", "nonfin", "stts_chng", "recovery_")
 _MONEY_RE = re.compile(
     r"(?:"
-    r"потер|возмещен|ущерб|убыт|fin_impact|recovery|денежн|штраф|прибыл|сумм\w*|\$+"
+    r"потер|возмещен|ущерб|убыт|fin_impact|recovery|денежн|штраф|прибыл|сумм\w*|финансов|последств|\$+"
     r"|(?::потер|возмещ|ущерб|убыт)"
     r")",
     re.IGNORECASE
@@ -223,7 +226,7 @@ def build_controller_context(user_msg, state, grounding, period_label,
     parts.append("# ДОСТУПНЫЕ ДЕЙСТВИЯ: " + ", ".join(names))
     parts.append(f"\n# ПОДСКАЗКА ПУТИ (детерминированная): {route_hint}")
     if route_hint == "spec_required":
-        parts.append("-> Для ЭТОГО запроса используй run_query_spec. Голый join_dfs/"
+        parts.append("-> Для ЭТОГО запроса используй run_preset (если есть подходящий готовый отчет/скрипт) или run_query_spec (для кастомного запроса). Голый join_dfs/"
                      "group_by по money-колонке main здесь запрещён (тул-гард вернёт ошибку).")
     if grounding:
         parts.append("\n# ЗАЗЕМЛЕНИЕ (реальные колонки/значения витрины – бери ОТСЮДА):")
@@ -326,15 +329,162 @@ async def run_agent_v2(*, state, user_msg, emit=None, llm=None, registry=None,
         llm = get_llm()
 
     schema = get_schema()
-    grounding = ground_query(user_msg)
-    period = parse_period(user_msg)
-    route_hint = route_path(user_msg, grounding, period)
+    
+    # --- Шаг проверки и снятия неоднозначности заземления (Grounding Disambiguation) ---
+    ambiguity_pending = getattr(state, "ambiguity_pending", None)
+    if ambiguity_pending:
+        choice = user_msg.lower()
+        options = ambiguity_pending["options"]
+        selected_opt = None
+        
+        # 1. Поиск по цифре
+        num_match = re.search(r"\b(\d+)\b", choice)
+        if num_match:
+            idx = int(num_match.group(1)) - 1
+            if 0 <= idx < len(options):
+                selected_opt = options[idx]
+                
+        # 2. Поиск по имени/описанию колонки или значению
+        if not selected_opt:
+            for opt in options:
+                desc = opt["description"].lower()
+                col = opt["column"].lower()
+                val = opt["value"].lower()
+                if col in choice or desc in choice or val in choice:
+                    selected_opt = opt
+                    break
+                    
+        # 3. Поиск по вхождениям ключевых корней
+        if not selected_opt:
+            if "процесс" in choice:
+                for opt in options:
+                    if "proc" in opt["column"].lower():
+                        selected_opt = opt
+                        break
+            elif "функциональн" in choice or "функ" in choice:
+                for opt in options:
+                    if "funct" in opt["column"].lower():
+                        selected_opt = opt
+                        break
+            elif "орг" in choice or "структур" in choice or "тб" in choice:
+                for opt in options:
+                    if "org" in opt["column"].lower() or "tb" in opt["column"].lower():
+                        selected_opt = opt
+                        break
+                        
+        # 4. Fallback через локальный Qwen
+        if not selected_opt:
+            try:
+                from local_qwen import ask_local_qwen
+                qwen_prompt = f"Пользователь выбрал вариант из списка в ответ на вопрос. Ответ пользователя: '{user_msg}'.\nВарианты:\n"
+                for i, opt in enumerate(options):
+                    qwen_prompt += f"{i+1}. {opt['description']} (колонка {opt['column']})\n"
+                qwen_prompt += f"\nВыведи строго одну цифру номера выбранного варианта (от 1 до {len(options)}). Ничего другого не пиши."
+                
+                qwen_res = ask_local_qwen([{"role": "user", "content": qwen_prompt}], max_tokens=10)
+                match = re.search(r"\b(\d+)\b", qwen_res)
+                if match:
+                    idx = int(match.group(1)) - 1
+                    if 0 <= idx < len(options):
+                        selected_opt = options[idx]
+            except Exception:
+                pass
+                
+        if not selected_opt:
+            selected_opt = options[0]
+            
+        original_query = ambiguity_pending["original_query"]
+        phrase_to_resolve = ambiguity_pending["phrase"].lower()
+        
+        # Пересчитываем заземление для исходного запроса
+        grounding = ground_query(original_query)
+        filtered_grounding = []
+        for h in grounding:
+            if h["phrase"].lower() == phrase_to_resolve:
+                if h["column"] == selected_opt["column"] and h["value"] == selected_opt["value"]:
+                    filtered_grounding.append(h)
+            else:
+                filtered_grounding.append(h)
+        grounding = filtered_grounding
+        user_msg = original_query
+        state.ambiguity_pending = None
+        period = parse_period(user_msg)
+        route_hint = route_path(user_msg, grounding, period)
+    else:
+        # Обычное заземление
+        grounding = ground_query(user_msg)
+        period = parse_period(user_msg)
+        route_hint = route_path(user_msg, grounding, period)
+        
+        # Поиск новых неоднозначностей
+        low_msg = user_msg.lower()
+        by_phrase = {}
+        for h in grounding:
+            col = h["column"]
+            if col in ("incdnt_sum", "recovery"):
+                continue
+            col_desc = col
+            for table in schema.tables.values():
+                for c in table.columns:
+                    if c.name == col:
+                        col_desc = c.description or col
+                        break
+            h_with_desc = dict(h)
+            h_with_desc["description"] = col_desc
+            by_phrase.setdefault(h["phrase"].lower(), []).append(h_with_desc)
+            
+        ambiguous_phrase = None
+        ambiguous_options = []
+        for phrase, opts in by_phrase.items():
+            unique_cols = set(opt["column"] for opt in opts)
+            if len(unique_cols) > 1:
+                # Пробуем снять неоднозначность по ключевым словам в запросе
+                resolved_opts = []
+                if "процесс" in low_msg or "продукт" in low_msg:
+                    resolved_opts = [opt for opt in opts if "proc" in opt["column"].lower()]
+                elif "функциональн" in low_msg or "функ" in low_msg:
+                    resolved_opts = [opt for opt in opts if "funct" in opt["column"].lower()]
+                elif "оргструктур" in low_msg or "орг.структур" in low_msg or "территориальн" in low_msg or "тб" in low_msg:
+                    resolved_opts = [opt for opt in opts if "org" in opt["column"].lower() or "tb" in opt["column"].lower()]
+                    
+                if len(resolved_opts) == 1:
+                    new_grounding = []
+                    for h in grounding:
+                        if h["phrase"].lower() == phrase:
+                            if h["column"] == resolved_opts[0]["column"] and h["value"] == resolved_opts[0]["value"]:
+                                new_grounding.append(h)
+                        else:
+                            new_grounding.append(h)
+                    grounding = new_grounding
+                    continue
+                    
+                ambiguous_phrase = phrase
+                ambiguous_options = opts
+                break
+                
+        if ambiguous_phrase:
+            state.ambiguity_pending = {
+                "original_query": user_msg,
+                "phrase": ambiguous_phrase,
+                "options": ambiguous_options
+            }
+            q = f"Вы указали '{ambiguous_phrase}', но это значение встречается в нескольких разрезах:\n"
+            for i, opt in enumerate(ambiguous_options):
+                q += f"{i+1}. **{opt['description']}** (значение: '{opt['value']}')\n"
+            q += "По какому из них выполнить фильтрацию? Пожалуйста, выберите номер или напишите название разреза."
+            
+            # Стримим уточнение
+            history = []
+            files = []
+            await _emit(emit, "clarification", {"question": q})
+            return AgentTurnResult(ok=True, ask_user=q, stuck=False, files=files, history=history)
 
     # прокидываем emit в компилятор (run_query_spec -> CompileContext.emit), чтобы
     # его под-шаги (загрузка, join, агрегат) уходили в премиальную ленту статусов.
     try:
         state.emit = emit
         state.cancelled = False  # сбрасываем флаг отмены прошлого turn'а (П6)
+        state.current_period = period
     except Exception:  # noqa: BLE001
         pass
 
@@ -373,8 +523,10 @@ async def run_agent_v2(*, state, user_msg, emit=None, llm=None, registry=None,
         await activity("think", "thinking", "Думаю над следующим шагом", None, "active")
         ctx = build_controller_context(user_msg, state, grounding,
                                        _period_label(period), history, route_hint, registry)
+        import uuid
+        salt = f"\n\n[Session: {getattr(state, 'session_id', 'default_session')}, Request ID: {uuid.uuid4().hex[:8]}, Iteration: {it}]"
         raw = await asyncio.to_thread(
-            llm.invoke, [{"role": "system", "content": sys},
+            llm.invoke, [{"role": "system", "content": sys + salt},
                          {"role": "user", "content": ctx}]
         )
         act, err = compile_action(parse_controller_json(raw), valid_tools)
@@ -412,7 +564,8 @@ async def run_agent_v2(*, state, user_msg, emit=None, llm=None, registry=None,
         sig_window.append(sig)
 
         cur_count = len(getattr(state, "dataframes", {})) + len(files)
-        iters_since_progress = 0 if cur_count > last_count else iters_since_progress + 1
+        is_search = act.action in ("search_values", "distinct_values")
+        iters_since_progress = 0 if (cur_count > last_count or is_search) else iters_since_progress + 1
         last_count = cur_count
         if iters_since_progress >= NO_PROGRESS_LIMIT:
             q = "Не получается продвинуться – уточни запрос."

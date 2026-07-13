@@ -231,6 +231,99 @@ def test_run_preset_async_emit():
         loop.close()
 
 
+def test_run_preset_period_mapping():
+    import asyncio
+    from backend.agent.tools.run_preset import run_preset
+    from unittest.mock import MagicMock
+    from backend.skills.runners.notebook_runner import get_runner
+    
+    ctx = MagicMock()
+    ctx.register_file = MagicMock()
+    ctx.register_dataframe = MagicMock()
+    
+    runner = get_runner()
+    original_run_phased = runner.run_phased
+    called_params = []
+    
+    def mock_run_phased(*args, **kwargs):
+        params = kwargs.get("params")
+        called_params.append(params)
+        return original_run_phased(*args, **kwargs)
+        
+    runner.run_phased = mock_run_phased
+    
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        result = loop.run_until_complete(
+            run_preset(ctx, "ior_hypothesis_v2", {
+                "period": {"text": "Q1 2025"}
+            })
+        )
+        assert result.ok is True
+        assert len(called_params) == 1
+        params = called_params[0]
+        assert "period" not in params
+        assert params["incdnt_entry_dt_begin"] == "2025-01-01"
+        assert params["incdnt_entry_dt_end"] == "2025-03-31"
+    finally:
+        runner.run_phased = original_run_phased
+        loop.close()
+
+
+def test_profile_dataframe_zero_loss_warning():
+    df = pd.DataFrame({
+        "incdnt_id": list(range(1, 35)),
+        "incdnt_desc": ["test"] * 34,
+        "incdnt_sum": [0] * 34,
+        "recovery": [0] * 34
+    })
+    profile = profile_dataframe(df)
+    assert "Данные по потерям отсутствуют (равны нулю)" in profile
+    assert "Не зацикливайся на нулевых потерях" in profile
+
+
+def test_profile_dataframe_side_by_side_mapping():
+    df = pd.DataFrame({
+        "incdnt_id": list(range(1, 35)),
+        "incdnt_desc": ["test"] * 34,
+        "incdnt_sum": [1000] * 34,
+        "recovery": [200] * 34
+    })
+    profile = profile_dataframe(df)
+    assert "Общая сумма всех последствий (incdnt_sum)" in profile
+    assert "Сумма возмещений (recovery)" in profile
+    assert "Чистые потери (Net Loss)" in profile
+
+
+def test_hypothesis_threshold_guard():
+    import asyncio
+    from backend.agent.hypothesis import generate_hypothesis_narrative
+    df = pd.DataFrame({
+        "incdnt_id": [101, 102, 103, 104, 105],
+        "incdnt_sum": [1000, 2000, 3000, 4000, 5000],
+        "recovery": [100, 200, 300, 400, 500],
+        "incdnt_status_name": ["Утверждение", "Утверждение", "Черновик", "Удален", "Удален"]
+    })
+    file_info = {"name": "small_test.xlsx", "size": "15 KB"}
+    
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        report = loop.run_until_complete(
+            generate_hypothesis_narrative("Выведи гипотезы", df, file_info, "session_123")
+        )
+        assert "Всего инцидентов в файле" in report
+        assert "15 000.00 ₽" in report
+        assert "1 500.00 ₽" in report
+        assert "13 500.00 ₽" in report
+        assert "Аналитические гипотезы не формировались, так как размер выборки составляет менее 20 инцидентов" in report
+        assert "Инцидент 105" in report
+        assert "Инцидент 104" in report
+    finally:
+        loop.close()
+
+
 if __name__ == "__main__":
     import traceback
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_")]

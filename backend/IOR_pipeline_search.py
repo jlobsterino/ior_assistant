@@ -474,15 +474,16 @@ def build_and_cache_small_index(session_id: str, target_ids: list, id_to_text_ma
             for doc_id in valid_ids
         ]
 
-        existing_history = _SMALL_FAISS_SESSION_CACHE.get(session_id, {}).get("history", [])
-
-        _SMALL_FAISS_SESSION_CACHE[session_id] = {
+        session_cache = _SMALL_FAISS_SESSION_CACHE.setdefault(session_id, {})
+        existing_history = session_cache.get("history", [])
+        session_cache.update({
             "index": small_index,
             "descriptions": ordered_descriptions,
             "id_to_text_map": {doc_id: id_to_text_map.get(doc_id, "") for doc_id in valid_ids},
-            "last_ask_user_stuck": True | False,
-            "history": existing_history
-        }
+            "last_ask_user_stuck": False,
+            "history": existing_history,
+            "target_ids": list(valid_ids)
+        })
         return True
     except Exception as e:
         print(f"[SMALL_FAISS] Ошибка сборки малого индекса: {e}")

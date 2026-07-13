@@ -35,7 +35,6 @@ def _wait_rate_limit(delay_sec: float) -> None:
         elapsed = time.perf_counter() - _last_invoke
         if elapsed < delay_sec:
             time.sleep(delay_sec - elapsed)
-        _last_invoke = time.perf_counter()
 
 
 class GigaChatService:
@@ -106,24 +105,50 @@ class GigaChatService:
                             else self.cfg.gigachat_temperature),
             "stream": False,
         }
-        try:
-            resp = self._client.post(self._chat_url, json=payload)
-            resp.raise_for_status()
-            data = resp.json()
-            # OpenAI-compatible: {"choices":[{"message":{"content":"..."}}]}
-            choices = data.get("choices") or []
-            if choices and isinstance(choices, list):
-                msg = choices[0].get("message") or {}
-                return msg.get("content", "")
-            # GigaChat иногда возвращает {"response": "..."} как fallback
-            if "response" in data:
-                return data["response"]
-            logger.warning("[LLM] Неожиданный формат ответа: %s",
-                           json.dumps(data, ensure_ascii=False)[:300])
-            return ""
-        except Exception as e:
-            logger.exception("[LLM] Ошибка вызова GigaChat: %s", e)
-            return f"[Ошибка LLM: {e}]"
+        import httpx
+        retries = 3
+        backoff = 2.0
+        
+        for attempt in range(retries):
+            _wait_rate_limit(self.cfg.gigachat_delay_sec)
+            try:
+                resp = self._client.post(self._chat_url, json=payload)
+                if resp.status_code == 429:
+                    if attempt < retries - 1:
+                        logger.warning("[LLM] Получен ответ 429 Too Many Requests. Попытка %d из %d. Ожидание %.1f сек...",
+                                       attempt + 1, retries, backoff)
+                        time.sleep(backoff)
+                        backoff *= 2.0
+                        continue
+                resp.raise_for_status()
+                data = resp.json()
+                # OpenAI-compatible: {"choices":[{"message":{"content":"..."}}]}
+                choices = data.get("choices") or []
+                if choices and isinstance(choices, list):
+                    msg = choices[0].get("message") or {}
+                    return msg.get("content", "")
+                # GigaChat иногда возвращает {"response": "..."} как fallback
+                if "response" in data:
+                    return data["response"]
+                logger.warning("[LLM] Неожиданный формат ответа: %s",
+                               json.dumps(data, ensure_ascii=False)[:300])
+                return ""
+            except httpx.HTTPStatusError as status_err:
+                if status_err.response.status_code == 429 and attempt < retries - 1:
+                    logger.warning("[LLM] HTTPStatusError 429. Попытка %d из %d. Ожидание %.1f сек...",
+                                   attempt + 1, retries, backoff)
+                    time.sleep(backoff)
+                    backoff *= 2.0
+                    continue
+                logger.exception("[LLM] HTTP status error: %s", status_err)
+                return f"[Ошибка LLM: {status_err}]"
+            except Exception as e:
+                logger.exception("[LLM] Ошибка вызова GigaChat: %s", e)
+                return f"[Ошибка LLM: {e}]"
+            finally:
+                global _last_invoke
+                with _invoke_lock:
+                    _last_invoke = time.perf_counter()
 
     def invoke_json(self, messages: list[dict[str, str]],
                     fallback: Optional[dict] = None) -> dict:

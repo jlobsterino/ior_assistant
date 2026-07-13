@@ -260,18 +260,21 @@ def create_app() -> FastAPI:
     _local_mode = (get_settings().app_env == "local")
     _frontend_dir = Path(__file__).parent.parent / "frontend"
 
-    @app.middleware("http")
-    async def _frontend_cache_control(request, call_next):
-        response = await call_next(request)
-        path = request.url.path
-        if (path.endswith(".jsx") or path.endswith(".css")
-                or path.endswith(".html") or path == "/"):
-            if _local_mode:
-                response.headers["Cache-Control"] = "no-store, must-revalidate"
-                response.headers["Pragma"] = "no-cache"
-            else:
-                response.headers["Cache-Control"] = "public, max-age=3600"
-        return response
+    class CacheControlStaticFiles(StaticFiles):
+        def __init__(self, *args, local_mode: bool = False, **kwargs):
+            self.local_mode = local_mode
+            super().__init__(*args, **kwargs)
+
+        async def get_response(self, path: str, scope):
+            response = await super().get_response(path, scope)
+            if (path.endswith(".jsx") or path.endswith(".css")
+                    or path.endswith(".html") or path == ""):
+                if self.local_mode:
+                    response.headers["Cache-Control"] = "no-store, must-revalidate"
+                    response.headers["Pragma"] = "no-cache"
+                else:
+                    response.headers["Cache-Control"] = "public, max-age=3600"
+            return response
 
     # Auto cache-bust для .jsx (Babel-inline трансформ держит файлы в памяти
     # по URL — без ?v=mtime после edit'а UI зависает на старой версии).
@@ -306,7 +309,7 @@ def create_app() -> FastAPI:
 
     # Статика (frontend)
     if _frontend_dir.exists():
-        app.mount("/", StaticFiles(directory=str(_frontend_dir), html=True), name="frontend")
+        app.mount("/", CacheControlStaticFiles(directory=str(_frontend_dir), html=True, local_mode=_local_mode), name="frontend")
 
     return app
 

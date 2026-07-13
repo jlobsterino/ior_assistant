@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import time
 from typing import AsyncIterator
 
@@ -215,6 +216,7 @@ async def run_agent(*, session_id: str,
     # регистрируем файлы, созданные тулами/компилятором (state.files)
     file_id_db = None
     f_meta = None
+    file_events_to_yield = []
     for f_meta in state.files.values():
         if getattr(f_meta, "_db_id", None):
             file_id_db = f_meta._db_id
@@ -227,10 +229,10 @@ async def run_agent(*, session_id: str,
 
                 file_id_db = f.id
                 f_meta._db_id = file_id_db
-                yield sse("file", {"file_id": file_id_db, "name": f_meta.name,
-                                   "size": _fmt_size(f_meta.size_bytes), "status": "ready",
-                                   "rows": f_rows, "columns": f_cols,
-                                   "sample": f_sample, "sample_headers": f_headers})
+                file_events_to_yield.append(sse("file", {"file_id": file_id_db, "name": f_meta.name,
+                                                   "size": _fmt_size(f_meta.size_bytes), "status": "ready",
+                                                   "rows": f_rows, "columns": f_cols,
+                                                   "sample": f_sample, "sample_headers": f_headers}))
         except Exception as e:  # noqa: BLE001
             logger.warning("[agent_flow] FileRepo.add: %s", e)
 
@@ -244,7 +246,7 @@ async def run_agent(*, session_id: str,
             "sample": f_sample,
             "sample_headers": f_headers,
             "status": "ready",
-            "has_csv": os.path.exists(f_meta.path.replace(".xlsx", ".csv")) if getattr(f_meta, "path", None) else False
+            "has_csv": os.path.exists(str(f_meta.path).replace(".xlsx", ".csv")) if getattr(f_meta, "path", None) else False
         }
 
     # Маркер успеха для IOR-роута: файл-выгрузка готова. Агрегированные выгрузки
@@ -277,9 +279,7 @@ async def run_agent(*, session_id: str,
             from backend.agent.result import build_result_package
             result_pkg = build_result_package(turn.spec_resolved, rdf, turn.funnel,
                                               turn.warnings, file_id_db)
-
             result_pkg["query"] = user_message  # для «сохранить отчёт» / повтора (П5)
-            yield sse("result", result_pkg)
     except Exception as e:  # noqa: BLE001
         logger.warning("[agent_flow] result package: %s", e)
 
@@ -299,7 +299,7 @@ async def run_agent(*, session_id: str,
             "path": getattr(first_file, "path", "")
         }
 
-    # нарратив строится по схеме: Отчет (описание) -> Гипотеза -> График
+    # нарратив строится по схеме: Отчет (описание) ->  Гипотеза -> График
     narrative = ""
     if rdf is not None and not rdf.empty:
         # 1. Отчет (описание выгрузки)
@@ -324,11 +324,13 @@ async def run_agent(*, session_id: str,
         if report_desc and not report_desc.endswith("\n\n"):
             report_desc = report_desc.rstrip() + "\n\n"
 
-        # 2. Гипотеза + 3. График (строятся в generate_hypothesis_narrative)
+        # 2. Гипотеза + 3.  График (строятся в generate_hypothesis_narrative)
         from backend.agent.hypothesis import generate_hypothesis_narrative
         yield sse("status", push("hypothesis", "Анализирую данные и генерирую гипотезу...", "active"))
+        yield sse("activity", {"id": "hypothesis", "kind": "think", "title": "Анализирую данные и генерирую гипотезу", "detail": "Строим гипотезы по выгрузке...", "status": "active"})
         hypothesis_narrative = await generate_hypothesis_narrative(user_message, rdf, file_info, session_id)
         yield sse("status", push("hypothesis", "Анализирую данные и генерирую гипотезу...", "done"))
+        yield sse("activity", {"id": "hypothesis", "kind": "think", "title": "Анализ завершен", "detail": "Гипотеза сформирована.", "status": "done"})
         narrative = report_desc + hypothesis_narrative
     else:
         # Если данных для анализа нет, выводим ответ контроллера или fallback
@@ -337,6 +339,12 @@ async def run_agent(*, session_id: str,
     for chunk in _chunk_text(narrative):
         yield sse("token", {"text": chunk})
         await asyncio.sleep(0.012)
+
+    # Выводим Excel превью и файлы ПОСЛЕ того как текст и график были отстримлены
+    for file_ev in file_events_to_yield:
+        yield file_ev
+    if result_pkg:
+        yield sse("result", result_pkg)
 
     try:
         with get_db() as db:
@@ -361,27 +369,13 @@ async def run_agent(*, session_id: str,
         id_col = None
         desc_col = None
         
-        # 1. Сначала пробуем выгруженный файл Excel
-        if f_meta and os.path.exists(f_meta.path):
-            try:
-                df_agent = pd.read_excel(f_meta.path)
-                df_agent.columns = [str(c).lower() for c in df_agent.columns]
-                id_col = next((c for c in ["incdnt_id", "incdnt_sid", "идентификатор события",
-                                           "идентификационный ключ инцидента операционного риска"]
-                               if c in df_agent.columns), None)
-                desc_col = next((c for c in ["incdnt_desc", "текст_иор", "incdnt_description",
-                                             "описание", "incdnt_full_descr_txt", "подробное описание"]
-                                 if c in df_agent.columns), None)
-            except Exception as e:
-                logger.warning("[agent_flow] FAISS prep read excel failed: %s", e)
-                
-        # 2. Если файл пустой, не содержит ID/описаний или вообще не создан — ищем детальный df в памяти сессии
-        if not (df_agent is not None and id_col and desc_col) and getattr(state, "dataframes", None):
+        # 1. Сначала ищем детальный df в памяти сессии (чтобы избежать потери точности при чтении Excel для больших ID)
+        if getattr(state, "dataframes", None):
             for df_key, df_val in reversed(list(state.dataframes.items())):
                 try:
                     df_val_copy = df_val.copy()
                     df_val_copy.columns = [str(c).lower() for c in df_val_copy.columns]
-                    cid_col = next((c for c in ["incdnt_id", "incdnt_sid", "идентификатор события",
+                    cid_col = next((c for c in ["incdnt_sid", "incdnt_id", "идентификатор события",
                                                 "идентификационный ключ инцидента операционного риска"]
                                    if c in df_val_copy.columns), None)
                     cdesc_col = next((c for c in ["incdnt_desc", "текст_иор", "incdnt_description",
@@ -391,10 +385,34 @@ async def run_agent(*, session_id: str,
                         df_agent = df_val_copy
                         id_col = cid_col
                         desc_col = cdesc_col
-                        logger.info(f"[agent_flow] Найдена детальная таблица '{df_key}' ({len(df_val)} строк) для построчного FAISS")
+                        logger.info(f"[agent_flow] Найдена детальная таблица '{df_key}' ({len(df_val)} строк) для построчного FAISS из памяти сессии")
                         break
                 except Exception as df_err:
-                    logger.warning("[agent_flow] Failed processing df %s for FAISS: %s", df_key, df_err)
+                    logger.warning("[agent_flow] Failed processing df %s from memory for FAISS: %s", df_key, df_err)
+                    
+        # 2. Если в памяти сессии ничего не найдено, пробуем выгруженный файл Excel как fallback
+        if not (df_agent is not None and id_col and desc_col) and f_meta and os.path.exists(f_meta.path):
+            try:
+                # Читаем сначала заголовки Excel для динамического определения ID-колонок и сохранения их строкового типа
+                df_headers = pd.read_excel(f_meta.path, nrows=0)
+                dtype_dict = {}
+                for col in df_headers.columns:
+                    col_lower = str(col).lower()
+                    if any(x in col_lower for x in ("id", "sid", "key", "номер", "идентификатор")):
+                        if any(x in col_lower for x in ("cnt", "sum", "amt", "val", "кол", "кол-во", "сумма")):
+                            continue
+                        dtype_dict[col] = str
+                
+                df_agent = pd.read_excel(f_meta.path, dtype=dtype_dict)
+                df_agent.columns = [str(c).lower() for c in df_agent.columns]
+                id_col = next((c for c in ["incdnt_sid", "incdnt_id", "идентификатор события",
+                                           "идентификационный ключ инцидента операционного риска"]
+                               if c in df_agent.columns), None)
+                desc_col = next((c for c in ["incdnt_desc", "текст_иор", "incdnt_description",
+                                             "описание", "incdnt_full_descr_txt", "подробное описание"]
+                                 if c in df_agent.columns), None)
+            except Exception as e:
+                logger.warning("[agent_flow] FAISS prep read excel fallback failed: %s", e)
                     
         # 3. Если детальные данные найдены, собираем FAISS-индекс для сессии
         if df_agent is not None and id_col and desc_col:
@@ -435,6 +453,8 @@ def _event_to_label(event: str, data: dict) -> str:
         return f"✔️ {data.get('tool', '?')}: {data.get('summary', 'done')[:80]}"
     if event == "step_failed":
         return f"⚠️ {data.get('tool', '?')} упал: {(data.get('error') or '')[:80]}"
+    if event == "notebook_phase":
+        return f"📓 {data.get('label', 'выполнение ноутбука')}"
     return ""
 
 

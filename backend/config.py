@@ -36,7 +36,7 @@ class Settings(BaseSettings):
     gigachat_api_url: Optional[str] = None
     jpy_api_token: Optional[str] = None
     gigachat_model: str = "GigaChat-3-Ultra"
-    gigachat_delay_sec: float = 6.0
+    gigachat_delay_sec: float = 7.0
     gigachat_temperature: float = 0.01
     gigachat_verify_ssl: bool = False
 

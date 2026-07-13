@@ -198,145 +198,386 @@ async def chat_ws(websocket: WebSocket):
 
         if is_complaint:
             from backend.storage.database import FileRepo, get_db
+            from backend.agent.complaint_hypothesis import (
+                _determine_complaint_route,
+                _COMPLAINTS_SESSION_CACHE,
+                generate_complaint_hypothesis_narrative,
+                classify_complaint_intent,
+                search_complaints_cache,
+                answer_complaint_details,
+                answer_complaint_follow_up,
+                answer_complaint_dialog
+            )
             try:
-                await websocket.send_text(json.dumps({
-                    "event": "status",
-                    "data": {"steps": [
-                        {"step": "search", "label": "Ищу похожие обращения в базе...", "status": "active"},
-                ]}
-                }, ensure_ascii=False))
-                await asyncio.sleep(0.1)
+                # Helper to send activities
+                async def send_activity(aid: str, kind: str, title: str, detail: str = None, status: str = "active"):
+                    await websocket.send_text(json.dumps({
+                        "event": "activity",
+                        "data": {
+                            "id": aid,
+                            "kind": kind,
+                            "title": title,
+                            "detail": detail,
+                            "status": status
+                        }
+                    }, ensure_ascii=False))
 
-                params = extract_search_params(message)
-                logger.info(f"[pipeline] params from LLM: {params}")
-                df_result = run_complaints_pipeline(
-                    query=params["query"],
-                    faiss_idx=faiss_loaded,
-                    bm25_indexes=bm25_indexes,
-                    top_k=params["top_k"],
-                    date_range=params["date_range"]
-                )
+                route = _determine_complaint_route(session_id)
+                logger.info(f"[COMPLAINT ROUTE] session={session_id} -> {route}")
 
-                if 'text' in df_result.columns:
-                    df_result = df_result.drop(columns=['text'])
+                if route == "analytical":
+                    # Step 1: Start search activity
+                    await send_activity(
+                        aid="fb_search_operation",
+                        kind="action",
+                        title="Поиск обращений в базе",
+                        detail="Ищу подходящие обращения через гибридный векторный и текстовый поиск...",
+                        status="active"
+                    )
+                    await websocket.send_text(json.dumps({
+                        "event": "status",
+                        "data": {"steps": [
+                            {"step": "search", "label": "Ищу похожие обращения в базе...", "status": "active"},
+                        ]}
+                    }, ensure_ascii=False))
+                    await asyncio.sleep(0.1)
 
-                descriptions = []
-                scores = []
-
-                for _, row in df_result.iterrows():
-                    desc = row.get('Короткое описание', '')
-                    score = row.get('score', 0)
-
-                    if desc and str(desc).strip():
-                        descriptions.append(str(desc).strip())
-                        scores.append(float(score) if score else 0.0)
-
-                summary_text = ""
-                if descriptions:
-                    summary_text = summarize_complaints(
-                        topic=params["query"],
-                        descriptions=descriptions,
-                        scores=scores,
+                    params = extract_search_params(message)
+                    logger.info(f"[pipeline] params from LLM: {params}")
+                    df_result = run_complaints_pipeline(
+                        query=params["query"],
+                        faiss_idx=faiss_loaded,
+                        bm25_indexes=bm25_indexes,
+                        top_k=params["top_k"],
+                        date_range=params["date_range"]
                     )
 
-                await websocket.send_text(json.dumps({
-                    "event": "status",
-                    "data": {
-                        "steps": [
-                            {"step": "search", "label": "Поиск завершен", "status": "done"},
-                            {"step": "result", "label": "🟢 Найдено обращений: " + str(len(df_result)), "status": "done"},
-                            {"step": "summary", "label": summary_text, "status": "done"}
-                        ]
+                    if 'text' in df_result.columns:
+                        df_result = df_result.drop(columns=['text'])
+
+                    # Populate complaints cache
+                    id_to_text_map = {}
+                    for _, row in df_result.iterrows():
+                        cid = str(row.get('id', ''))
+                        desc = row.get('Короткое описание', '')
+                        dialogue = row.get('Транскрибация диалога', '')
+                        date_str = row.get('date', '')
+                        if cid:
+                            id_to_text_map[cid] = {
+                                "id": cid,
+                                "desc": desc,
+                                "dialogue": dialogue,
+                                "date": date_str
+                            }
+                    _COMPLAINTS_SESSION_CACHE[session_id] = {
+                        "id_to_text_map": id_to_text_map
                     }
-                }))
 
-                file_id = str(uuid.uuid4())
-                data_dir = Path("/home/datalab/nfs/disrupt_tester2/data/generated_files")
-                data_dir.mkdir(parents=True, exist_ok=True)
-
-                xlsx_path = data_dir / f"{file_id}.xlsx"
-                csv_path = data_dir / f"{file_id}.csv"
-
-                df_result.to_excel(xlsx_path, index=False)
-                df_result.to_csv(csv_path, index=False, encoding="utf-8")
-
-                with get_db() as db:
-                    f = FileRepo.add(
-                        db,
-                        session_id=session_id,
-                        file_path=str(xlsx_path),
-                        file_name=f"osiris_{params['query'][:30]}.xlsx",
-                        size_bytes=xlsx_path.stat().st_size,
-                        total_rows=len(df_result),
-                        status="ready",
+                    # Step 2: Complete search activity
+                    await send_activity(
+                        aid="fb_search_operation",
+                        kind="action",
+                        title="Поиск завершен",
+                        detail=f"Найдено {len(df_result)} релевантных обращений.",
+                        status="done"
                     )
-                    FileRepo.update_progress(
-                        db,
-                        file_id=f.id,
-                        csv_path=str(csv_path),
-                        status="ready"
+
+                    # Step 3: Start hypothesis generation activity
+                    await send_activity(
+                        aid="fb_summary_operation",
+                        kind="think",
+                        title="Анализ и гипотезы",
+                        detail="Формируем гипотезы о корневых причинах с помощью GigaChat...",
+                        status="active"
                     )
-                    file_id = f.id
 
-                preview_k = params["top_k"] or 5
-                top_n = df_result.head(preview_k).copy()
-                top_n.insert(0, 'Ранг релевантности', range(1, len(top_n) + 1))
+                    await websocket.send_text(json.dumps({
+                        "event": "status",
+                        "data": {
+                            "steps": [
+                                {"step": "search", "label": "Поиск завершен", "status": "done"},
+                                {"step": "result", "label": f"🟢 Найдено обращений: {len(df_result)}", "status": "done"},
+                                {"step": "summary", "label": "Анализ обращений и формирование гипотез...", "status": "active"}
+                            ]
+                        }
+                    }, ensure_ascii=False))
 
-                if 'score' in df_result.columns:
-                    df_result = df_result.drop(columns=['score'])
-                sample_headers = list(top_n.columns)
-                sample = [[str(v) if v is not None else "-" for v in row] for row in top_n.values.tolist()]
+                    # Step 4: Export spreadsheet
+                    file_id = str(uuid.uuid4())
+                    data_dir = Path("/home/datalab/nfs/disrupt_tester2/data/generated_files")
+                    data_dir.mkdir(parents=True, exist_ok=True)
 
-                await websocket.send_text(json.dumps({
-                    "event": "file",
-                    "data": {
-                        "file_id": file_id,
-                        "name": f"osiris_{params['query'][:30]}.xlsx ({len(df_result)} обращений)",
+                    xlsx_path = data_dir / f"{file_id}.xlsx"
+                    csv_path = data_dir / f"{file_id}.csv"
+
+                    df_result.to_excel(xlsx_path, index=False)
+                    df_result.to_csv(csv_path, index=False, encoding="utf-8")
+
+                    with get_db() as db:
+                        f = FileRepo.add(
+                            db,
+                            session_id=session_id,
+                            file_path=str(xlsx_path),
+                            file_name=f"osiris_{params['query'][:30]}.xlsx",
+                            size_bytes=xlsx_path.stat().st_size,
+                            total_rows=len(df_result),
+                            status="ready",
+                        )
+                        FileRepo.update_progress(
+                            db,
+                            file_id=f.id,
+                            csv_path=str(csv_path),
+                            status="ready"
+                        )
+                        file_id = f.id
+
+                    preview_k = params["top_k"] or 5
+                    top_n = df_result.head(preview_k).copy()
+                    top_n.insert(0, 'Ранг релевантности', range(1, len(top_n) + 1))
+
+                    sample_headers = list(top_n.columns)
+                    sample = [[str(v) if v is not None else "-" for v in row] for row in top_n.values.tolist()]
+
+                    await websocket.send_text(json.dumps({
+                        "event": "file",
+                        "data": {
+                            "file_id": file_id,
+                            "name": f"osiris_{params['query'][:30]}.xlsx ({len(df_result)} обращений)",
                             "rows": len(df_result),
                             "columns": len(df_result.columns),
                             "sample_headers": sample_headers,
                             "sample": sample,
                             "has_csv": True,
                             "status": "ready",
-                    }
-                }, ensure_ascii=False))
-
-                with get_db() as db:
-                    MessageRepo.add(db, session_id=session_id, role='user', content=message)
-                    MessageRepo.add(
-                        db,
-                        session_id=session_id,
-                        role='assistant',
-                        content=f"Найдено {len(df_result)} обращений по запросу: {params['query']}",
-                        meta={
-                            "skill_id": None,
-                            "skill_title": None,
-                            "file_id": file_id,
-                            "stats": None,
-                            "excel": {
-                                "file_id": file_id,
-                                "name": f"osiris_{params['query'][:30]}.xlsx ({len(df_result)} обращений)",
-                                "rows": len(df_result),
-                                "columns": len(df_result.columns),
-                                "sample_headers": sample_headers,
-                                "sample": sample,
-                                "has_csv": True,
-                                "status": "ready",
-                            },
-                            "dossier": None,
-                            "followups": None,
-                            "sseSteps": [
-                                {"step": "search", "label": "Поиск завершен", "status": "done"},
-                                {"step": "result", "label": f"🟢 Найдено обращений: {len(df_result)}", "status": "done"}
-                            ],
-                            "plan": None,
-                            "step_results": []
                         }
+                    }, ensure_ascii=False))
+
+                    # Generate narrative
+                    file_info = {
+                        "name": f"osiris_{params['query'][:30]}.xlsx",
+                        "size": f"{xlsx_path.stat().st_size / 1024:.1f} KB"
+                    }
+                    summary_text = await generate_complaint_hypothesis_narrative(
+                        user_msg=message,
+                        df=df_result,
+                        file_info=file_info
                     )
-                    SessionRepo.update_title(db, session_id=session_id, title=params['query'][:50])
-                    SessionRepo.touch(db, session_id=session_id)
+
+                    # Stream narrative token by token to chat
+                    chunk_size = 4
+                    for i in range(0, len(summary_text), chunk_size):
+                        chunk = summary_text[i:i + chunk_size]
+                        await websocket.send_text(json.dumps({
+                            "event": "token",
+                            "data": {"text": chunk}
+                        }, ensure_ascii=False))
+                        await asyncio.sleep(0.05)
+
+                    # Step 5: Complete hypothesis generation activity
+                    await send_activity(
+                        aid="fb_summary_operation",
+                        kind="think",
+                        title="Анализ завершен",
+                        detail="Краткий отчет и гипотезы выведены в интерфейс.",
+                        status="done"
+                    )
+
+                    await websocket.send_text(json.dumps({
+                        "event": "status",
+                        "data": {
+                            "steps": [
+                                {"step": "search", "label": "Поиск завершен", "status": "done"},
+                                {"step": "result", "label": f"🟢 Найдено обращений: {len(df_result)}", "status": "done"},
+                                {"step": "summary", "label": "Анализ и гипотезы сформированы", "status": "done"}
+                            ]
+                        }
+                    }, ensure_ascii=False))
+
+                    # Save history in DB
+                    with get_db() as db:
+                        MessageRepo.add(db, session_id=session_id, role='user', content=message)
+                        MessageRepo.add(
+                            db,
+                            session_id=session_id,
+                            role='assistant',
+                            content=summary_text,
+                            meta={
+                                "skill_id": None,
+                                "skill_title": None,
+                                "file_id": file_id,
+                                "stats": None,
+                                "excel": {
+                                    "file_id": file_id,
+                                    "name": f"osiris_{params['query'][:30]}.xlsx ({len(df_result)} обращений)",
+                                    "rows": len(df_result),
+                                    "columns": len(df_result.columns),
+                                    "sample_headers": sample_headers,
+                                    "sample": sample,
+                                    "has_csv": True,
+                                    "status": "ready",
+                                },
+                                "dossier": None,
+                                "followups": None,
+                                "sseSteps": [
+                                    {"step": "search", "label": "Поиск завершен", "status": "done"},
+                                    {"step": "result", "label": f"🟢 Найдено обращений: {len(df_result)}", "status": "done"},
+                                    {"step": "summary", "label": "Анализ и гипотезы сформированы", "status": "done"}
+                                ],
+                                "plan": None,
+                                "step_results": []
+                            }
+                        )
+                        SessionRepo.update_title(db, session_id=session_id, title=params['query'][:50])
+                        SessionRepo.touch(db, session_id=session_id)
+
+                    # Send done event to clear frontend loader shimmer
+                    await websocket.send_text(json.dumps({
+                        "event": "done",
+                        "data": {}
+                    }))
+
+                elif route == "follow_up":
+                    import time
+                    session_data = _COMPLAINTS_SESSION_CACHE.get(session_id, {})
+                    id_to_text_map: dict = session_data.get("id_to_text_map", {})
+                    history = get_session_history(session_id)
+
+                    timeline = []
+                    started_time = time.perf_counter()
+
+                    def _ts() -> str:
+                        return f"+{time.perf_counter() - started_time:0.1f}s"
+
+                    def make_status_payload(step_id: str, label: str, status: str = "active") -> dict:
+                        for t in timeline:
+                            if t.get("status") == "active":
+                                t["status"] = "done"
+                        timeline.append({
+                            "step": step_id,
+                            "label": label,
+                            "time": _ts(),
+                            "status": status
+                        })
+                        return {"event": "status", "data": {"steps": list(timeline)}}
+
+                    # 1. Start thinking status
+                    await websocket.send_text(json.dumps(
+                        make_status_payload("thinking", "💬 Анализирую запрос...", "active"),
+                        ensure_ascii=False
+                    ))
+                    await asyncio.sleep(0.05)
+
+                    response_text = None
+
+                    # Check for ID matches (standalone word or substring of keys)
+                    id_matches = []
+                    for cid in id_to_text_map.keys():
+                        if str(cid).lower() in message.lower():
+                            id_matches.append(cid)
+
+                    if id_matches:
+                        await websocket.send_text(json.dumps(
+                            make_status_payload("generating", "✍️ Формирую детальный анализ по обращениям...", "active"),
+                            ensure_ascii=False
+                        ))
+                        matched_complaints = [id_to_text_map[cid] for cid in id_matches]
+                        try:
+                            response_text = await asyncio.to_thread(
+                                answer_complaint_details,
+                                user_query=message,
+                                complaints=matched_complaints,
+                                history=history
+                            )
+                        except Exception as e:
+                            logger.error(f"[COMPLAINT FOLLOW_UP] answer_complaint_details failed: {e}")
+                            response_text = f"Не удалось извлечь детали обращений: {e}"
+                    else:
+                        # General follow-up / QA based on all cached complaints
+                        await websocket.send_text(json.dumps(
+                            make_status_payload("intent", "🔍 Определение намерения...", "active"),
+                            ensure_ascii=False
+                        ))
+                        intent = await asyncio.to_thread(classify_complaint_intent, message)
+                        
+                        if intent == "search":
+                            await websocket.send_text(json.dumps(
+                                make_status_payload("search", "🔎 Поиск релевантных обращений...", "active"),
+                                ensure_ascii=False
+                            ))
+                            matched_list = search_complaints_cache(message, id_to_text_map)
+                            await websocket.send_text(json.dumps(
+                                make_status_payload("generating", "✍️ Формирую аналитический ответ...", "active"),
+                                ensure_ascii=False
+                            ))
+                            try:
+                                response_text = await asyncio.to_thread(
+                                    answer_complaint_follow_up,
+                                    user_query=message,
+                                    complaints=matched_list,
+                                    history=history
+                                )
+                            except Exception as e:
+                                logger.error(f"[COMPLAINT FOLLOW_UP] answer_complaint_follow_up failed: {e}")
+                                response_text = "Произошла ошибка при анализе обращений."
+                        else:
+                            await websocket.send_text(json.dumps(
+                                make_status_payload("generating", "💬 Формирую ответ в режиме диалога...", "active"),
+                                ensure_ascii=False
+                            ))
+                            try:
+                                response_text = await asyncio.to_thread(
+                                    answer_complaint_dialog,
+                                    user_query=message,
+                                    history=history
+                                )
+                            except Exception as e:
+                                logger.error(f"[COMPLAINT FOLLOW_UP] answer_complaint_dialog failed: {e}")
+                                response_text = "Произошла ошибка при ведении диалога."
+
+                    # Stream text tokens with pacing
+                    update_session_history(session_id, message, response_text)
+
+                    def chunk_text(text: str, words_per_chunk: int = 4) -> list[str]:
+                        if not text:
+                            return []
+                        words = text.split(" ")
+                        chunks = []
+                        for i in range(0, len(words), words_per_chunk):
+                            piece = " ".join(words[i:i + words_per_chunk])
+                            if i + words_per_chunk < len(words):
+                                piece += " "
+                            chunks.append(piece)
+                        return chunks
+
+                    for chunk in chunk_text(response_text):
+                        await websocket.send_text(json.dumps({
+                            "event": "token",
+                            "data": {"text": chunk}
+                        }, ensure_ascii=False))
+                        await asyncio.sleep(0.012)
+
+                    await websocket.send_text(json.dumps(
+                        make_status_payload("done", "🟢 Ответ готов", "done"),
+                        ensure_ascii=False
+                    ))
+
+                    duration_ms = int((time.perf_counter() - started_time) * 1000)
+                    await websocket.send_text(json.dumps({
+                        "event": "done",
+                        "data": {"file_id": None, "duration_ms": duration_ms}
+                    }, ensure_ascii=False))
+
+                    # Save history in DB
+                    try:
+                        with get_db() as db:
+                            MessageRepo.add(db, session_id=session_id, role="user", content=message)
+                            MessageRepo.add(db, session_id=session_id, role="assistant", content=response_text)
+                            logger.info(f"[COMPLAINT] История обновлена для сессии {session_id}")
+                    except Exception as db_err:
+                        logger.error(f"[COMPLAINT] Ошибка записи в БД: {db_err}")
 
             except Exception as e:
+                logger.error(f"[pipeline] Ошибка: {str(e)}", exc_info=True)
                 await websocket.send_text(json.dumps({
                     "event": "error",
                     "data": {"message": f"Ошибка пайплайна: {str(e)}"}
@@ -464,17 +705,20 @@ async def chat_ws(websocket: WebSocket):
                     # БЛОК 5: Аналитический ответ и суммаризация через Qwen (IMG_7093)
                     # ==============================================================================
 
-                    if agent_success and session_data.get("target_ids"):
-                        # Агент успешно завершил работу и сформировал построчные данные.
-                        # Нарратив (гипотеза + статистика + график) уже сгенерирован агентом и отправлен клиенту в run_agent.
-                        # Дополнительный вызов Qwen для суммаризации не нужен, так как он создаст дублирующий/противоречивый вывод.
+                    has_results = bool(session_data.get("target_ids") or session_data.get("agent_file_id"))
+                    if agent_success and has_results:
                         from backend.agent.state import get_session_state
                         state = get_session_state(session_id)
                         narrative = ""
-                        if state.history and state.history[-1]["role"] == "assistant":
-                            narrative = state.history[-1]["content"]
-                        
+                        if state.history:
+                            for msg_item in reversed(state.history):
+                                if msg_item.get("role") == "assistant" and msg_item.get("content"):
+                                    narrative = msg_item.get("content")
+                                    break
                         update_session_history(session_id, message, narrative or "Выгрузка завершена успешно.")
+                        session_data["stuck_strikes"] = 0
+                        _save_ior_session(session_id, session_data)
+                        logger.info("[IOR AGENT] Выгрузка успешна, история сохранена.")
 
                     # ==============================================================================
                     # БЛОК 6: Обработка стопоров, уточнений и запуск fallback логики (IMG_7094)
@@ -493,15 +737,11 @@ async def chat_ws(websocket: WebSocket):
                             "(агрегат) - успех, fallback не нужен"
                         )
                     elif "last_ask_user_stuck" in session_data and not session_data["last_ask_user_stuck"]:
-                        clarify_count = session_data.get("clarify_strikes", 0) + 1
-                        if clarify_count >= 2:
-                            session_data["clarify_strikes"] = 0
-                            _save_ior_session(session_id, session_data)
-                            logger.info("[IOR AGENT] Повторное уточнение -> fallback")
-                        else:
-                            session_data["clarify_strikes"] = clarify_count
-                            _save_ior_session(session_id, session_data)
-                            agent_success = True
+                        # Обычное диалоговое уточнение (не технический затык) не должно приводить к fallback
+                        session_data["clarify_strikes"] = 0
+                        _save_ior_session(session_id, session_data)
+                        agent_success = True
+                        logger.info("[IOR AGENT] Обычное уточнение/вопрос к пользователю - fallback не нужен")
                     elif session_data.get("last_ask_user_stuck"):
                         strikes = session_data.get("stuck_strikes", 0) + 1
                         if strikes < 2:
@@ -680,7 +920,7 @@ async def chat_ws(websocket: WebSocket):
                                         processed_row.append(str(v))
                                 sample.append(processed_row)
 
-                            await websocket.send_text(json.dumps({
+                            file_event_payload = {
                                 "event": "file",
                                 "data": {
                                     "file_id": file_id,
@@ -692,7 +932,7 @@ async def chat_ws(websocket: WebSocket):
                                     "has_csv": True,
                                     "status": "ready"
                                 }
-                            }, ensure_ascii=False))
+                            }
 
                             # ШАГ 3: Запускаем Qwen для генерации суммаризации (Возвращаем её!)
                             await send_fb_activity(
@@ -737,6 +977,10 @@ async def chat_ws(websocket: WebSocket):
                                     "data": {"text": chunk}
                                 }, ensure_ascii=False))
                                 await asyncio.sleep(0.05)
+
+                            # Отправляем файл на скачивание (появление плашки XLSX в интерфейсе) после генерации текста
+                            if file_event_payload:
+                                await websocket.send_text(json.dumps(file_event_payload, ensure_ascii=False))
 
                             # Закрываем шаг суммаризации
                             await send_fb_activity(fb_summary_id, "think", "Анализ завершен", "Краткий отчет выведен в интерфейс.", "done")
@@ -788,6 +1032,8 @@ async def chat_ws(websocket: WebSocket):
 # ВЕТКА 2: FOLLOW_UP – единый чат (бывшие detail + follow_up + followup_dialog)
 # ==============================================================================
             elif route == "follow_up":
+                import time
+                from local_qwen import classify_intent_with_qwen
                 session_data = _get_ior_session(session_id)
 
                 logger.info(f"[IOR_DEBUG] session_data keys: {list(session_data.keys())}")
@@ -796,14 +1042,29 @@ async def chat_ws(websocket: WebSocket):
                 id_to_text_map: dict = session_data.get("id_to_text_map", {})
                 history = get_session_history(session_id)
 
-                await websocket.send_text(json.dumps({
-                    "event": "status",
-                    "data": {
-                        "steps": [
-                            {"step": "thinking", "label": "💬 Обрабатываю запрос...", "status": "active"}
-                        ]
-                    }
-                }, ensure_ascii=False))
+                timeline = []
+                started_time = time.perf_counter()
+
+                def _ts() -> str:
+                    return f"+{time.perf_counter() - started_time:0.1f}s"
+
+                def make_status_payload(step_id: str, label: str, status: str = "active") -> dict:
+                    for t in timeline:
+                        if t.get("status") == "active":
+                            t["status"] = "done"
+                    timeline.append({
+                        "step": step_id,
+                        "label": label,
+                        "time": _ts(),
+                        "status": status
+                    })
+                    return {"event": "status", "data": {"steps": list(timeline)}}
+
+                # 1. Начало обработки
+                await websocket.send_text(json.dumps(
+                    make_status_payload("thinking", "💬 Анализирую запрос...", "active"),
+                    ensure_ascii=False
+                ))
                 await asyncio.sleep(0.05)
 
                 qwen_response = None
@@ -811,6 +1072,10 @@ async def chat_ws(websocket: WebSocket):
                 # Случай А: EVE-ID в запросе
                 eve_matches = re.findall(r'EVE-\d+', message, re.IGNORECASE)
                 if eve_matches:
+                    await websocket.send_text(json.dumps(
+                        make_status_payload("generating", "✍️ Формирую подробный ответ по инцидентам...", "active"),
+                        ensure_ascii=False
+                    ))
                     ior_texts = {
                         sid: id_to_text_map[sid]
                         for sid in eve_matches
@@ -862,29 +1127,57 @@ async def chat_ws(websocket: WebSocket):
 
                 # Случай Б: FAISS-поиск (EVE-ID не найден)
                 elif "index" in session_data:
+                    # Сначала определяем интент пользователя
+                    await websocket.send_text(json.dumps(
+                        make_status_payload("intent", "🔍 Определение намерения...", "active"),
+                        ensure_ascii=False
+                    ))
+                    
+                    intent = "search"
                     try:
-                        retrieved = search_small_index(
-                            session_id=session_id,
-                            query=message,
-                            threshold=0.5,
-                            max_candidates=25,
-                        )
-                        if retrieved:
-                            descriptions = [{"id": r["id"], "text": r["text"]} for r in retrieved]
-                            logger.info(f"[IOR FOLLOW_UP] FAISS нашёл {len(descriptions)} релевантных")
-                            qwen_response = await asyncio.to_thread(
-                                answer_follow_up_with_qwen,
-                                user_query=message,
-                                descriptions=descriptions,
-                                history=history,
-                            )
-                        else:
-                            logger.info("[IOR FOLLOW_UP] FAISS ничего не нашёл -> чистый диалог")
+                        intent = await asyncio.to_thread(classify_intent_with_qwen, message)
+                        logger.info(f"[IOR FOLLOW_UP] Classified intent for message '{message[:50]}': {intent}")
                     except Exception as e:
-                        logger.error(f"[IOR FOLLOW_UP] search_small_index упал: {e}")
+                        logger.error(f"[IOR FOLLOW_UP] Failed to classify intent: {e}")
+                        intent = "search"  # fallback
+                    
+                    if intent == "search":
+                        await websocket.send_text(json.dumps(
+                            make_status_payload("search", "🔎 Поиск релевантных инцидентов...", "active"),
+                            ensure_ascii=False
+                        ))
+                        try:
+                            retrieved = search_small_index(
+                                session_id=session_id,
+                                query=message,
+                                threshold=0.5,
+                                max_candidates=25,
+                            )
+                            if retrieved:
+                                descriptions = [{"id": r["id"], "text": r["text"]} for r in retrieved]
+                                logger.info(f"[IOR FOLLOW_UP] FAISS нашёл {len(descriptions)} релевантных")
+                                
+                                await websocket.send_text(json.dumps(
+                                    make_status_payload("generating", "✍️ Формирую аналитический ответ...", "active"),
+                                    ensure_ascii=False
+                                ))
+                                qwen_response = await asyncio.to_thread(
+                                    answer_follow_up_with_qwen,
+                                    user_query=message,
+                                    descriptions=descriptions,
+                                    history=history,
+                                )
+                            else:
+                                logger.info("[IOR FOLLOW_UP] FAISS ничего не нашёл -> чистый диалог")
+                        except Exception as e:
+                            logger.error(f"[IOR FOLLOW_UP] search_small_index упал: {e}")
 
-                # Случай В: нет индекса или FAISS ничего не вернул -> просто чат
+                # Случай В: нет индекса или FAISS ничего не вернул или интент = chat -> просто чат
                 if qwen_response is None:
+                    await websocket.send_text(json.dumps(
+                        make_status_payload("generating", "💬 Формирую ответ в режиме диалога...", "active"),
+                        ensure_ascii=False
+                    ))
                     try:
                         if history:
                             qwen_response = await asyncio.to_thread(
@@ -912,22 +1205,35 @@ async def chat_ws(websocket: WebSocket):
                 # Стриминг
                 update_session_history(session_id, message, summary_text)
 
-                chunk_size = 4
-                for i in range(0, len(summary_text), chunk_size):
-                    chunk = summary_text[i:i + chunk_size]
+                # Построчное разбиение по словам для плавного и красивого стриминга (как в analytical агенте)
+                def chunk_text(text: str, words_per_chunk: int = 4) -> list[str]:
+                    if not text:
+                        return []
+                    words = text.split(" ")
+                    chunks = []
+                    for i in range(0, len(words), words_per_chunk):
+                        piece = " ".join(words[i:i + words_per_chunk])
+                        if i + words_per_chunk < len(words):
+                            piece += " "
+                        chunks.append(piece)
+                    return chunks
+
+                for chunk in chunk_text(summary_text):
                     await websocket.send_text(json.dumps({
                         "event": "token",
                         "data": {"text": chunk}
                     }, ensure_ascii=False))
-                    await asyncio.sleep(0.05)
+                    await asyncio.sleep(0.012)
 
+                await websocket.send_text(json.dumps(
+                    make_status_payload("done", "🟢 Ответ готов", "done"),
+                    ensure_ascii=False
+                ))
+
+                duration_ms = int((time.perf_counter() - started_time) * 1000)
                 await websocket.send_text(json.dumps({
-                    "event": "status",
-                    "data": {
-                        "steps": [
-                            {"step": "qwen_done", "label": "🟢 Анализ завершён", "status": "done"}
-                        ]
-                    }
+                    "event": "done",
+                    "data": {"file_id": None, "duration_ms": duration_ms}
                 }, ensure_ascii=False))
 
                 # Сохраняем в БД

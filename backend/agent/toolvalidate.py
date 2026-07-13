@@ -114,7 +114,19 @@ def parse_controller_json(text: str) -> dict:
             if depth == 0:
                 s = s[i:j + 1]
                 break
+    # Убираем комментарии // и /* */
+    s_clean = re.sub(r"//.*$", "", s, flags=re.MULTILINE)
+    s_clean = re.sub(r"/\*.*?\*/", "", s_clean, flags=re.DOTALL)
+    s_clean = s_clean.strip()
+    
     try:
-        return json.loads(s)
+        return json.loads(s_clean)
     except Exception:  # noqa: BLE001
+        try:
+            import ast
+            parsed = ast.literal_eval(s_clean)
+            if isinstance(parsed, dict):
+                return parsed
+        except Exception:  # noqa: BLE001
+            pass
         return {}

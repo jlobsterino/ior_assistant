@@ -191,6 +191,39 @@ def test_autoexport_when_final_without_file():
     assert any(f.get("file_id") == "file_9" for f in res.files), res.files
 
 
+def test_grounding_disambiguation():
+    import backend.agent.controller as ctrl
+    old_ground_query = ctrl.ground_query
+    
+    mock_hits = [
+        {"phrase": "риски", "column": "funct_block_lvl_3_name", "value": "Блок Риски", "count": 100, "score": 0.9},
+        {"phrase": "риски", "column": "org_struct_lvl_3_name", "value": "Блок Риски", "count": 200, "score": 0.9},
+        {"phrase": "риски", "column": "proc_lvl_2_name", "value": "Управление рисками", "count": 300, "score": 0.9}
+    ]
+    ctrl.ground_query = lambda query, *args, **kwargs: mock_hits if "риски" in query else []
+    
+    try:
+        state = FakeState()
+        # 1. Первый ход: запрос с неоднозначной фразой "риски"
+        # Ожидаем, что контроллер сразу вернет уточняющий вопрос (ask_user)
+        res, _ = _run("инциденты по блоку риски", [], state=state)
+        assert res.ok
+        assert res.ask_user is not None
+        assert "разрезах" in res.ask_user
+        assert hasattr(state, "ambiguity_pending")
+        assert state.ambiguity_pending is not None
+        assert state.ambiguity_pending["phrase"] == "риски"
+        
+        # 2. Второй ход: ответ пользователя (например, "по процессу")
+        # Ожидаем, что состояние очистится и запустится стандартный ReAct-цикл (FakeLLM вернет final)
+        res2, _ = _run("по процессу", [_act("final", text="отчет готов")], state=state)
+        assert res2.ok
+        assert state.ambiguity_pending is None
+        assert res2.final_text == "отчет готов"
+    finally:
+        ctrl.ground_query = old_ground_query
+
+
 if __name__ == "__main__":
     import traceback
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_")]

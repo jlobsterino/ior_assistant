@@ -92,8 +92,47 @@ def _validate_enum_filters(table: str, where: Optional[dict]) -> Optional[str]:
     enum_map = {c.name: c.enum_values for c in t.columns if c.enum_values}
     if not enum_map:
         return None
+
+    from backend.agent.resolve.value_search import search_values
+
+    mods = {}
+    to_delete = []
+
     for key, val in where.items():
         # Только прямые =. Скипаем __like / __ne / __gte / dict-ranges / list (IN).
+        if "__" in key or isinstance(val, (dict, list)) or val is None:
+            continue
+        if key in enum_map and isinstance(val, str) and val not in enum_map[key]:
+            # Ищем совпадения в указанной колонке и вообще везде
+            hits = search_values(val, columns=[key], min_score=0.6)
+            hits_anywhere = search_values(val, min_score=0.6)
+            
+            best_col_hit = hits[0] if hits else None
+            best_any_hit = hits_anywhere[0] if hits_anywhere else None
+            
+            # Если в другой колонке той же таблицы есть существенно лучший матч
+            if best_any_hit and best_any_hit.column != key:
+                col_score = best_col_hit.score if best_col_hit else 0.0
+                if best_any_hit.score > col_score + 0.15 or (col_score < 0.8 and best_any_hit.score >= 0.85):
+                    to_delete.append(key)
+                    mods[best_any_hit.column] = best_any_hit.value
+                    continue
+                    
+            if best_col_hit:
+                mods[key] = best_col_hit.value
+            elif best_any_hit:
+                to_delete.append(key)
+                mods[best_any_hit.column] = best_any_hit.value
+
+    # Применяем модификации
+    for k in to_delete:
+        if k in where:
+            del where[k]
+    for k, v in mods.items():
+        where[k] = v
+
+    # Финальная проверка после модификаций
+    for key, val in where.items():
         if "__" in key or isinstance(val, (dict, list)) or val is None:
             continue
         if key in enum_map and isinstance(val, str) and val not in enum_map[key]:
@@ -589,6 +628,11 @@ async def export_excel(ctx, df_id: str,
       — последние 3 нужны UI для превью карточки скачивания.
     """
     df, df_id = await _resolve_df(ctx, df_id)
+    from backend.agent.query_spec import reorder_columns
+    df_cols = list(df.columns)
+    sorted_cols = reorder_columns(df_cols)
+    if sorted_cols != df_cols:
+        df = df[sorted_cols]
     # —— ГАРД пустого финального df (§3.8) — В САМОМ НАЧАЛЕ, до get_settings/sanucu —
     from backend.agent.query_spec import is_empty_df  # Lazy: pydantic-safe import
     if is_empty_df(df):
@@ -670,6 +714,32 @@ def _normalize_df_for_excel(df):
                     out[col] = ser.apply(
                         lambda x: float(x) if isinstance(x, Decimal)
                                   else (None if x is None else x))
+                    continue
+
+            # Преобразуем строковые денежные колонки в числовые типы
+            col_lower = str(col).lower()
+            if any(k in col_lower for k in ("sum", "amt", "loss", "recovery", "потер", "ущерб", "возмещ", "сумм")):
+                if not any(k in col_lower for k in ("id", "sid", "key", "номер", "идентификатор")):
+                    try:
+                        s_cleaned = ser.astype(str).str.replace(r"[^\d\.\,\-]", "", regex=True)
+                        s_cleaned = s_cleaned.str.replace(",", ".", regex=False)
+                        numeric_ser = pd.to_numeric(s_cleaned, errors="coerce")
+                        if numeric_ser.notna().sum() >= ser.notna().sum() * 0.5:
+                            out[col] = numeric_ser.fillna(0.0)
+                    except Exception:
+                        pass
+
+    # Стандартизация названий колонок в результирующем Excel
+    rename_dict = {}
+    for col in out.columns:
+        col_lower = str(col).lower()
+        if any(x in col_lower for x in ("incdnt_sum", "общая сумма", "сумма последствий")) and not any(x in col_lower for x in ("rec", "возмещ", "возврат")):
+            rename_dict[col] = "Общая сумма последствий (руб.)"
+        elif any(x in col_lower for x in ("recovery", "возмещ", "возврат")):
+            rename_dict[col] = "Сумма возмещений (руб.)"
+    if rename_dict:
+        out = out.rename(columns=rename_dict)
+
     return out
 
 
@@ -773,6 +843,11 @@ def _format_bytes(n: int) -> str:
 async def export_csv(ctx, df_id: str, name: Optional[str] = None) -> ToolResult:
     """Сохранить DF в csv."""
     df, df_id = await _resolve_df(ctx, df_id)
+    from backend.agent.query_spec import reorder_columns
+    df_cols = list(df.columns)
+    sorted_cols = reorder_columns(df_cols)
+    if sorted_cols != df_cols:
+        df = df[sorted_cols]
     # —— ГАРД пустого финального df (§3.8) — В САМОМ НАЧАЛЕ —
     from backend.agent.query_spec import is_empty_df  # lazy: pydantic-safe import
     if is_empty_df(df):

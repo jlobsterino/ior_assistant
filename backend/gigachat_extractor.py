@@ -196,3 +196,5 @@ def def_summarize_complaints(topic: str, descriptions: list[str],
     except Exception as e:
         print(f"Ошибка саммаризации: {e}")
         return ""
+
+summarize_complaints = def_summarize_complaints

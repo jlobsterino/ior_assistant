@@ -36,10 +36,196 @@ def _skill_ids() -> list[str]:
         return []
 
 
+SKILL_ALLOWED_PARAMS = {
+    "ior_hypothesis_v2": {
+        "incdnt_entry_dt_begin", "incdnt_entry_dt_end",
+        "status_filter", "tb_filter", "block_filter", "additional_sql_filter"
+    },
+    "deleted_ior_v2": {
+        "incdnt_entry_dt_begin", "incdnt_entry_dt_end", "ORG_PREFIXES", "additional_sql_filter"
+    },
+    "financial_consequences_ior_v2": {
+        "incdnt_entry_dt_begin", "incdnt_entry_dt_end"
+    },
+    "vozmeshenie_ior_v2": {
+        "incdnt_entry_dt_begin", "incdnt_entry_dt_end"
+    },
+    "ior_nonfinancial_consequences_v2": {
+        "incdnt_entry_dt_begin", "incdnt_entry_dt_end"
+    },
+    "credit_no_way_collect_debt_v2": {
+        "incdnt_entry_dt_begin", "incdnt_entry_dt_end"
+    },
+    "report_period_specific_ior_v2": {
+        "incdnt_sid"
+    },
+    "ior_period_pao_sberbank_v2": {
+        "incdnt_entry_dt_begin", "incdnt_entry_dt_end"
+    }
+}
+
+
 async def run_preset(ctx, skill_id: str, params: dict | None = None, emit=None) -> ToolResult:
     """Запускает Papermill-скрипт. Регистрирует получившийся xlsx как файл
     и data как dataframe (для возможной пост-обработки).
     """
+    params = params or {}
+    
+    # 1. Авто-декодирование period/date параметров для устойчивости
+    period_raw = None
+    for k in ["period", "period_intent", "date_range"]:
+        if k in params:
+            period_raw = params.pop(k)
+            
+    if period_raw:
+        period_text = ""
+        if isinstance(period_raw, dict) and "text" in period_raw:
+            period_text = period_raw["text"]
+        elif isinstance(period_raw, str):
+            period_text = period_raw
+            
+        if period_text:
+            from backend.agent.resolve.period_parser import parse_period
+            from datetime import datetime, timedelta
+            p_obj = parse_period(period_text)
+            if p_obj:
+                params["incdnt_entry_dt_begin"] = p_obj.start
+                try:
+                    end_dt = datetime.strptime(p_obj.end, "%Y-%m-%d") - timedelta(days=1)
+                    params["incdnt_entry_dt_end"] = end_dt.strftime("%Y-%m-%d")
+                except Exception:
+                    params["incdnt_entry_dt_end"] = p_obj.end
+
+    # Если даты так и не определены, берем из детерминированно распарсенного периода текущей сессии
+    current_period = getattr(ctx, "current_period", None)
+    if current_period:
+        if "incdnt_entry_dt_begin" not in params:
+            params["incdnt_entry_dt_begin"] = current_period.start
+        if "incdnt_entry_dt_end" not in params:
+            from datetime import datetime, timedelta
+            try:
+                end_dt = datetime.strptime(current_period.end, "%Y-%m-%d") - timedelta(days=1)
+                params["incdnt_entry_dt_end"] = end_dt.strftime("%Y-%m-%d")
+            except Exception:
+                params["incdnt_entry_dt_end"] = current_period.end
+
+    # 2. Выделение и нормализация фильтров оргструктуры, блоков и статусов
+    tb_val = None
+    for k in ["org_struct_lvl_3_name", "tb_filter", "tb", "tb_name"]:
+        if k in params:
+            tb_val = params.pop(k)
+            
+    block_val = None
+    for k in ["funct_block_lvl_2_name", "funct_block_lvl_3_name", "block_filter", "block", "block_name"]:
+        if k in params:
+            block_val = params.pop(k)
+            
+    status_val = None
+    for k in ["incdnt_status_name", "status_filter", "status"]:
+        if k in params:
+            status_val = params.pop(k)
+
+    # Канонизация и заземление категориальных значений через поисковый движок
+    from backend.agent.resolve.value_search import search_values
+    if tb_val:
+        hits = search_values(str(tb_val), columns=["org_struct_lvl_3_name"], min_score=0.6)
+        if hits:
+            tb_val = hits[0].value
+        else:
+            hits_any = search_values(str(tb_val), min_score=0.6)
+            if hits_any:
+                tb_val = hits_any[0].value
+
+    if block_val:
+        hits = search_values(str(block_val), columns=["funct_block_lvl_2_name", "funct_block_lvl_3_name", "funct_block_lvl_4_name"], min_score=0.6)
+        if hits:
+            block_val = hits[0].value
+        else:
+            hits_any = search_values(str(block_val), min_score=0.6)
+            if hits_any:
+                block_val = hits_any[0].value
+
+    if status_val:
+        hits = search_values(str(status_val), columns=["incdnt_status_name"], min_score=0.6)
+        if hits:
+            status_val = hits[0].value
+        else:
+            hits_any = search_values(str(status_val), min_score=0.6)
+            if hits_any:
+                status_val = hits_any[0].value
+
+    allowed = SKILL_ALLOWED_PARAMS.get(skill_id, set())
+    
+    if tb_val:
+        if "tb_filter" in allowed:
+            params["tb_filter"] = tb_val
+        elif "additional_sql_filter" in allowed:
+            params["additional_sql_filter"] = f"org_struct_lvl_3_name = '{tb_val}'"
+            
+    if block_val:
+        if "block_filter" in allowed:
+            params["block_filter"] = block_val
+        elif "additional_sql_filter" in allowed:
+            existing = params.get("additional_sql_filter")
+            if existing:
+                params["additional_sql_filter"] = f"{existing} AND funct_block_lvl_3_name = '{block_val}'"
+            else:
+                params["additional_sql_filter"] = f"funct_block_lvl_3_name = '{block_val}'"
+            
+    if status_val:
+        if "status_filter" in allowed:
+            params["status_filter"] = status_val
+
+    # Генерация SQL-подзапросов для числовых денежных фильтров при наличии money-интентов
+    user_msg = ""
+    if hasattr(ctx, "history") and ctx.history:
+        for m_obj in reversed(ctx.history):
+            if m_obj.get("role") == "user":
+                user_msg = m_obj.get("content", "")
+                break
+
+    if user_msg and "additional_sql_filter" in allowed:
+        import re
+        pattern = r"(\bбольше\b|\bменьше\b|>\s*|<\s*|=)\s*(\d+(?:[\s\.,]\d+)*)\s*(млрд|млн|тыс|руб|коп)?"
+        money_matches = re.findall(pattern, user_msg.lower())
+        subqueries = []
+        for op_str, num_str, unit in money_matches:
+            num_clean = num_str.replace(" ", "").replace(",", ".").replace("\xa0", "")
+            try:
+                val = float(num_clean)
+            except ValueError:
+                continue
+            if unit == "млрд":
+                val *= 1_000_000_000
+            elif unit == "млн":
+                val *= 1_000_000
+            elif unit == "тыс":
+                val *= 1_000
+            op = ">" if ("больше" in op_str or ">" in op_str) else ("<" if ("меньше" in op_str or "<" in op_str) else "=")
+            
+            is_recovery = any(x in user_msg.lower() for x in ("возмещ", "возврат", "компенс", "страхов"))
+            is_direct = any(x in user_msg.lower() for x in ("прям", "прямого", "прямые"))
+            
+            if is_recovery:
+                subq = f"incdnt_id IN (SELECT incdnt_id FROM arnsdpsbx_t_team_sva_oarb_4.d6_base_of_knowledge_incident_recovery GROUP BY incdnt_id HAVING SUM(recovery_rub_amt) {op} {val})"
+            elif is_direct:
+                subq = f"incdnt_id IN (SELECT incdnt_id FROM arnsdpsbx_t_team_sva_oarb_4.d6_base_of_knowledge_incident_fin_impact WHERE fin_impact_type_name = 'Прямая потеря' GROUP BY incdnt_id HAVING SUM(fin_impact_rub_amt) {op} {val})"
+            else:
+                subq = f"incdnt_id IN (SELECT incdnt_id FROM arnsdpsbx_t_team_sva_oarb_4.d6_base_of_knowledge_incident_fin_impact GROUP BY incdnt_id HAVING SUM(fin_impact_rub_amt) {op} {val})"
+            subqueries.append(subq)
+            
+        if subqueries:
+            subq_str = " AND ".join(subqueries)
+            existing = params.get("additional_sql_filter")
+            if existing:
+                params["additional_sql_filter"] = f"({existing}) AND ({subq_str})"
+            else:
+                params["additional_sql_filter"] = subq_str
+
+    # 3. Очистка параметров от не поддерживаемых данным ноутбуком полей (чтобы не спамить ворнинги)
+    if allowed:
+        params = {k: v for k, v in params.items() if k in allowed}
+
     emit = getattr(ctx, "emit", None) or emit
     skill_registry = get_skill_registry()
     skill = skill_registry.get(skill_id)
@@ -100,9 +286,133 @@ async def run_preset(ctx, skill_id: str, params: dict | None = None, emit=None) 
         output["rows"] = result.rows
         output["size"] = result.excel_meta.get("size") if result.excel_meta else None
 
-    # Подгружаем как pandas DF для возможного post-processing
+    # Подгружаем как pandas DF для возможного post-processing и фильтрации
     try:
-        df = pd.read_excel(result.excel_path, engine="openpyxl")
+        # Сначала считываем заголовки Excel для динамического определения ID-колонок и сохранения их строкового типа
+        df_headers = pd.read_excel(result.excel_path, nrows=0, engine="openpyxl")
+        dtype_dict = {}
+        for col in df_headers.columns:
+            col_lower = str(col).lower()
+            if any(x in col_lower for x in ("id", "sid", "key", "номер", "идентификатор")):
+                if any(x in col_lower for x in ("cnt", "sum", "amt", "val", "кол", "кол-во", "сумма")):
+                    continue
+                dtype_dict[col] = str
+        
+        df = pd.read_excel(result.excel_path, dtype=dtype_dict, engine="openpyxl")
+        
+        # Пост-фильтрация по оргструктуре, блоку, статусу (для пресетов, не поддерживающих эти параметры напрямую в Spark)
+        def filter_by_value(dataframe, col_keywords, val):
+            words = [w for w in str(val).lower().split() if w not in ("банк", "блок", "отделение", "филиал", "пао", "сбербанк", "сбер")]
+            if not words:
+                return dataframe
+            stem = words[0][:5]
+            for col in dataframe.columns:
+                col_lower = str(col).lower()
+                if any(kw in col_lower for kw in col_keywords):
+                    mask = dataframe[col].astype(str).str.lower().str.contains(stem, na=False)
+                    return dataframe[mask]
+            return dataframe
+
+        original_len = len(df)
+        
+        if tb_val and "tb_filter" not in allowed and "additional_sql_filter" not in allowed:
+            df = filter_by_value(df, ["tb", "bank", "орг", "org_struct_lvl_3_name", "территориальный"], tb_val)
+            
+        if block_val and "block_filter" not in allowed and "additional_sql_filter" not in allowed:
+            df = filter_by_value(df, ["block", "блок", "funct_block", "направление"], block_val)
+            
+        if status_val and "status_filter" not in allowed:
+            df = filter_by_value(df, ["status", "статус", "stts"], status_val)
+
+        # Очищаем все денежные колонки и превращаем их в float
+        money_cols = []
+        for col in df.columns:
+            col_lower = str(col).lower()
+            if any(k in col_lower for k in ("sum", "amt", "loss", "recovery", "потер", "ущерб", "возмещ", "сумм")):
+                if not any(k in col_lower for k in ("id", "sid", "key", "номер", "идентификатор")):
+                    money_cols.append(col)
+
+        def safe_to_numeric(series):
+            if pd.api.types.is_numeric_dtype(series):
+                return series.fillna(0.0)
+            cleaned = series.astype(str).str.replace(r"[^\d\.\,\-]", "", regex=True)
+            cleaned = cleaned.str.replace(",", ".", regex=False)
+            return pd.to_numeric(cleaned, errors="coerce").fillna(0.0)
+
+        for col in money_cols:
+            try:
+                df[col] = safe_to_numeric(df[col])
+            except Exception as e:
+                logger.warning("[run_preset] failed to convert money col %s to numeric: %s", col, e)
+            
+        # Локальный фильтр по денежным порогам
+        user_msg = ""
+        if hasattr(ctx, "history") and ctx.history:
+            for m_obj in reversed(ctx.history):
+                if m_obj.get("role") == "user":
+                    user_msg = m_obj.get("content", "")
+                    break
+                    
+        if user_msg:
+            import re
+            money_m = re.findall(
+                r"(\bбольше\b|\bменьше\b|>\s*|<\s*|=)\s*(\d+(?:[\s\.,]\d+)*)\s*(млрд|млн|тыс|руб|коп)?",
+                user_msg.lower()
+            )
+            for op_str, num_str, unit in money_m:
+                num_clean = num_str.replace(" ", "").replace(",", ".").replace("\xa0", "")
+                try:
+                    val = float(num_clean)
+                except ValueError:
+                    continue
+                if unit == "млрд":
+                    val *= 1_000_000_000
+                elif unit == "млн":
+                    val *= 1_000_000
+                elif unit == "тыс":
+                    val *= 1_000
+                op = ">" if ("больше" in op_str or ">" in op_str) else ("<" if ("меньше" in op_str or "<" in op_str) else "=")
+                
+                for col in money_cols:
+                    try:
+                        if op == ">":
+                            df = df[df[col] > val]
+                        elif op == "<":
+                            df = df[df[col] < val]
+                        elif op == "=":
+                            df = df[df[col] == val]
+                    except Exception as e:
+                        logger.warning("[run_preset] failed to filter money col %s: %s", col, e)
+
+        # Стандартизация названий колонок
+        rename_dict = {}
+        for col in df.columns:
+            col_lower = str(col).lower()
+            if any(x in col_lower for x in ("incdnt_sum", "общая сумма", "сумма последствий")) and not any(x in col_lower for x in ("rec", "возмещ", "возврат")):
+                rename_dict[col] = "Общая сумма последствий (руб.)"
+            elif any(x in col_lower for x in ("recovery", "возмещ", "возврат")):
+                rename_dict[col] = "Сумма возмещений (руб.)"
+        if rename_dict:
+            df = df.rename(columns=rename_dict)
+                        
+        from backend.agent.query_spec import reorder_columns
+        df_cols = list(df.columns)
+        sorted_cols = reorder_columns(df_cols)
+        if sorted_cols != df_cols:
+            df = df[sorted_cols]
+            
+        df.to_excel(result.excel_path, index=False, engine="openpyxl")
+        result.rows = len(df)
+        if result.excel_path.exists():
+            try:
+                result.excel_meta["size"] = result.excel_path.stat().st_size
+            except Exception:
+                pass
+        # Также обновляем метаданные в output
+        output["rows"] = len(df)
+        if "size" in output and result.excel_meta:
+            output["size"] = result.excel_meta.get("size")
+
         meta = ctx.register_dataframe(
             df,
             description=f"Результат preset'а {skill.title} "

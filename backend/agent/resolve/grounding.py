@@ -276,10 +276,27 @@ def ground_query(user_query: str, max_hits: int = 10) -> list[dict]:
     if not user_query or not user_query.strip():
         return []
 
+    # Расширяем аббревиатуры ТБ Сбера для надежного заземления
+    tb_map = {
+        r"\bсзб\b": "Северо-Западный банк",
+        r"\bмб\b": "Московский банк",
+        r"\bввб\b": "Волго-Вятский банк",
+        r"\bюзб\b": "Юго-Западный банк",
+        r"\bсрб\b": "Среднерусский банк",
+        r"\bсиб\b": "Сибирский банк",
+        r"\bурб\b": "Уральский банк",
+        r"\bпвб\b": "Поволжский банк",
+        r"\bдвб\b": "Дальневосточный банк",
+        r"\bбб\b": "Байкальский банк"
+    }
+    cleaned_query = user_query
+    for pattern, replacement in tb_map.items():
+        cleaned_query = re.sub(pattern, replacement, cleaned_query, flags=re.IGNORECASE)
+
     hits: list[dict] = []
     seen: set = set()
 
-    for phrase in _extract_phrases(user_query):
+    for phrase in _extract_phrases(cleaned_query):
         code = _is_code(phrase)
         min_score = _CODE_MIN if code else _GROUND_STRONG
         for cand in search_values(phrase, top_k=3, min_score=min_score):

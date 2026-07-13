@@ -127,6 +127,37 @@ def parse_period(text: str, column: str = DEFAULT_DATE_COLUMN) -> Optional[Perio
         return None
     t = text.lower().replace("  ", " ")
 
+    # Обработка периодов типа "первые N дней/суток месяца года"
+    _GENITIVE_MONTHS = {
+        "январь": "января", "февраль": "февраля", "март": "марта", "апрель": "апреля",
+        "май": "мая", "июнь": "июня", "июль": "июля", "август": "августа",
+        "сентябрь": "сентября", "октябрь": "октября", "ноябрь": "ноября", "декабрь": "декабря"
+    }
+    _WORD_NUMBERS = {
+        "один": 1, "два": 2, "три": 3, "четыре": 4, "пять": 5,
+        "шесть": 6, "семь": 7, "восемь": 8, "девять": 9, "десять": 10
+    }
+    
+    days_m = re.search(
+        r"\b(?:первые\s+(\d+|один|два|три|четыре|пять|шесть|семь|восемь|девять|десять)\s+(?:дней|дня|день|суток|сутки|сут)"
+        r"|(\d+|один|два|три|четыре|пять|шесть|семь|восемь|девять|десять)\s+первых\s+(?:дней|дня|день|суток|сутки|сут))\b",
+        t
+    )
+    if days_m:
+        raw_val = days_m.group(1) or days_m.group(2)
+        days_count = int(raw_val) if raw_val.isdigit() else _WORD_NUMBERS.get(raw_val, 1)
+        years = [int(y) for y in re.findall(r"\b(20\d\d)\b", t)]
+        months = _find_months(t)
+        if years and months:
+            year = years[-1]
+            m_num = months[0][1]
+            m_name = months[0][2]
+            m_lbl = _GENITIVE_MONTHS.get(m_name, m_name)
+            start = date(year, m_num, 1)
+            end = start + timedelta(days=days_count)
+            lbl = f"первые {days_count} дня {m_lbl} {year}"
+            return Period(column, start.isoformat(), end.isoformat(), lbl, "range")
+
     # # 0) Явные даты DD.MM.YYYY / YYYY-MM-DD – ПРИОРИТЕТ над эвристикой года/месяца.
     # Иначе «01.11.2025-20.11.2025» схватывало бы только год -> весь 2025 (тихо неверно).
     expl = _find_explicit_dates(t)

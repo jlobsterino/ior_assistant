@@ -55,10 +55,27 @@ def inspect_excel(xlsx_path: Path, *, sheet_name: str = "Отчет_ОпРиск
 def _inspect_pandas(xlsx_path: Path, *, sheet_name: str = "Отчет_ОпРиски", max_sample: int = 5) -> dict:
     import pandas as pd
 
+    # Сначала считываем заголовки Excel для динамического определения ID-колонок и сохранения их строкового типа
+    dtype_dict = {}
     try:
-        df = pd.read_excel(xlsx_path, sheet_name=sheet_name, engine="openpyxl")
+        try:
+            df_headers = pd.read_excel(xlsx_path, sheet_name=sheet_name, nrows=0, engine="openpyxl")
+        except Exception:
+            df_headers = pd.read_excel(xlsx_path, sheet_name=0, nrows=0, engine="openpyxl")
+        
+        for col in df_headers.columns:
+            col_lower = str(col).lower()
+            if any(x in col_lower for x in ("id", "sid", "key", "номер", "идентификатор")):
+                if any(x in col_lower for x in ("cnt", "sum", "amt", "val", "кол", "кол-во", "сумма")):
+                    continue
+                dtype_dict[col] = str
     except Exception:
-        df = pd.read_excel(xlsx_path, sheet_name=0, engine="openpyxl")
+        pass
+
+    try:
+        df = pd.read_excel(xlsx_path, sheet_name=sheet_name, dtype=dtype_dict, engine="openpyxl")
+    except Exception:
+        df = pd.read_excel(xlsx_path, sheet_name=0, dtype=dtype_dict, engine="openpyxl")
 
     cols = list(df.columns)
     rows = len(df)

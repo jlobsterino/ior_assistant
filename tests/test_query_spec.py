@@ -382,6 +382,170 @@ def test_period_intent_as_string_coerced():
     assert where.get("incdnt_entry_dt__lt") == "2026-04-01"
 
 
+def test_relative_period_parsing_in_expand():
+    from backend.agent.query_spec import expand_period_filters
+    from datetime import date as _d
+    where, labels = expand_period_filters(
+        {"filters": [{"kind": "period", "intent": "первые 2 дня апреля 2025 года",
+                      "column": "incdnt_entry_dt", "required": True}]}, _d(2026, 6, 24))
+    assert where.get("incdnt_entry_dt__gte") == "2025-04-01"
+    assert where.get("incdnt_entry_dt__lt") == "2025-04-03"
+    assert labels["incdnt_entry_dt"] == "первые 2 дня апреля 2025"
+
+
+def test_sort_normalization_validate_spec():
+    from backend.agent.query_spec import validate_spec
+    spec = {
+        "source": {"table": MAIN},
+        "sort": ["incdnt_id"]
+    }
+    err = validate_spec(spec, SCHEMA)
+    assert err is None
+    
+    spec2 = {
+        "source": {"table": MAIN},
+        "sort": ["nonexistent_column"]
+    }
+    err2 = validate_spec(spec2, SCHEMA)
+    assert err2 is not None
+    assert "не найден среди колонок" in err2
+
+
+def test_auto_normalization_joins_and_money_guard_rewrite():
+    from backend.agent.query_spec import normalize_spec, validate_spec
+    spec = {
+        "source": {
+            "table": MAIN,
+            "joins": [
+                {
+                    "table": "d6_base_of_knowledge_incident_fin_impact",
+                    "on": "incdnt_id",
+                    "how": "left",
+                    "pre_aggregate": {
+                        "group_by": ["incdnt_id"],
+                        "filters": [{"kind": "categorical", "column": "fin_impact_type_name", "op": "eq", "value": "Прямая потеря"}]
+                    }
+                }
+            ]
+        }
+    }
+    norm = normalize_spec(spec)
+    pa = norm["source"]["joins"][0]["pre_aggregate"]
+    assert "agg" in pa
+    assert "fin_impact_rub_amt" in pa["agg"]
+    assert pa["agg"]["fin_impact_rub_amt"]["as"] == "direct_loss"
+    assert pa["agg"]["fin_impact_rub_amt"]["filter"] == {"fin_impact_type_name": {"eq": "Прямая потеря"}}
+
+    spec_money = {
+        "source": {"table": MAIN},
+        "filters": [
+            {"kind": "range", "column": "incdnt_sum", "op": "gt", "value": 1000000000}
+        ]
+    }
+    norm_money = normalize_spec(spec_money)
+    assert len(norm_money["source"]["joins"]) == 1
+    assert norm_money["source"]["joins"][0]["table"] == "d6_base_of_knowledge_incident_fin_impact"
+    assert norm_money["filters"][0]["column"] == "direct_loss"
+    
+    err = validate_spec(norm_money, SCHEMA)
+    assert err is None
+
+
+def test_advanced_preset_normalization_and_money_subquery():
+    import asyncio
+    from unittest.mock import patch, MagicMock
+    from backend.agent.tools.run_preset import run_preset
+    from backend.skills.runners.notebook_runner import ExecutionResult
+    from pathlib import Path
+    
+    class FakeCtx:
+        def __init__(self):
+            self.history = [{"role": "user", "content": "Выведи ИОР с прямыми потерями больше 500 тыс рублей по Волго-Вятскому банку"}]
+            self.current_period = None
+            self.emit = MagicMock()
+            self.dataframes = {}
+            
+        def register_file(self, name, path, size_bytes, mime_type):
+            mock_file = MagicMock()
+            mock_file.file_id = "file_123"
+            mock_file.name = name
+            return mock_file
+
+        def register_dataframe(self, df, description="", created_by=""):
+            mock_meta = MagicMock()
+            mock_meta.df_id = "df_123"
+            mock_meta.rows = 10
+            return mock_meta
+            
+    ctx = FakeCtx()
+    params = {
+        "org_struct_lvl_3_name": "Волго-Вятскому банку",
+        "incdnt_entry_dt_begin": "2025-01-01",
+        "incdnt_entry_dt_end": "2025-12-31"
+    }
+    
+    dummy_result = ExecutionResult(
+        excel_path=Path("d:/ior_assistant/backend/agent/tools/run_preset.py"),
+        excel_filename="test.xlsx",
+        rows=10,
+        excel_meta={"size": "10 KB"},
+        duration_ms=100
+    )
+    
+    mock_runner = MagicMock()
+    mock_runner.run_phased.return_value = dummy_result
+    
+    async def run_test():
+        with patch("backend.agent.tools.run_preset.get_runner", return_value=mock_runner), \
+             patch("pandas.read_excel", return_value=MagicMock()):
+            res = await run_preset(ctx, "ior_hypothesis_v2", params)
+            assert res.ok, res.error
+            called_args = mock_runner.run_phased.call_args[1]
+            called_params = called_args["params"]
+            
+            assert called_params["tb_filter"] == "Волго-Вятский банк"
+            assert "additional_sql_filter" in called_params
+            assert "HAVING SUM(fin_impact_rub_amt) > 500000.0" in called_params["additional_sql_filter"]
+            assert "fin_impact_type_name = 'Прямая потеря'" in called_params["additional_sql_filter"]
+            
+    asyncio.run(run_test())
+
+
+def test_advanced_normalize_spec_soft_grounding():
+    from backend.agent.query_spec import normalize_spec
+    # 1. Test correcting column lvl_2 -> lvl_3 for "Волго-Вятский банк"
+    spec = {
+        "source": {"table": MAIN},
+        "filters": [
+            {"kind": "categorical", "column": "org_struct_lvl_2_name", "op": "eq", "value": "Волго-Вятский банк", "grounded": True}
+        ]
+    }
+    norm = normalize_spec(spec)
+    assert norm["filters"][0]["column"] == "org_struct_lvl_3_name"
+    assert norm["filters"][0]["value"] == "Волго-Вятский банк"
+
+    # 2. Test correcting low-score column mismatch
+    spec2 = {
+        "source": {"table": MAIN},
+        "filters": [
+            {"kind": "categorical", "column": "org_struct_lvl_2_name", "op": "eq", "value": "московского банка", "grounded": True}
+        ]
+    }
+    norm2 = normalize_spec(spec2)
+    assert norm2["filters"][0]["column"] == "org_struct_lvl_3_name"
+    assert norm2["filters"][0]["value"] == "Московский банк"
+
+
+def test_validate_enum_filters_soft_correction():
+    from backend.agent.tools.dataframe_ops import _validate_enum_filters
+    where = {"org_struct_lvl_2_name": "московского банка"}
+    err = _validate_enum_filters(MAIN, where)
+    assert err is None
+    assert "org_struct_lvl_3_name" in where
+    assert where["org_struct_lvl_3_name"] == "Московский банк"
+    assert "org_struct_lvl_2_name" not in where
+
+
 if __name__ == "__main__":
     import traceback
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_")]

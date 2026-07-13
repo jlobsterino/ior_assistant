@@ -38,6 +38,33 @@ from backend.skills.runners.excel_inspector import inspect_excel
 
 logger = logging.getLogger(__name__)
 
+
+def reorder_columns(cols: list[str]) -> list[str]:
+    new_cols = list(cols)
+    sid_candidates = ["incdnt_sid", "Идентификатор события"]
+    id_candidates = ["incdnt_id", "Идентификационный ключ инцидента операционного риска"]
+    
+    sid_found = None
+    for c in sid_candidates:
+        if c in new_cols:
+            sid_found = c
+            new_cols.remove(c)
+            break
+            
+    id_found = None
+    for c in id_candidates:
+        if c in new_cols:
+            id_found = c
+            new_cols.remove(c)
+            break
+            
+    if sid_found:
+        new_cols.insert(0, sid_found)
+    if id_found:
+        new_cols.append(id_found)
+    return new_cols
+
+
 # Глобальный лок: только одно in-process выполнение notebook'а одновременно
 # (Spark - единая JVM, нет смысла запускать параллельно).
 _exec_lock = threading.Lock()
@@ -183,7 +210,7 @@ class NotebookRunner:
         """Запустить notebook или вернуть mock-результат."""
         started = datetime.now()
 
-        if self.cfg.use_mock_runner or not notebook_path:
+        if self.cfg.use_mock_runner or not notebook_path or os.name == "nt":
             logger.info("[NotebookRunner] mock-mode -> %s", skill_id)
             return self._mock_run(skill_id, params, started)
 
@@ -218,7 +245,7 @@ class NotebookRunner:
         В mock-режиме сразу делегирует в _mock_run и эмитит pseudo-фазы.
         """
         started = datetime.now()
-        if self.cfg.use_mock_runner or not notebook_path:
+        if self.cfg.use_mock_runner or not notebook_path or os.name == "nt":
             emit(Phase("spark_starting", label="Mock-runner (без Spark)"))
             result = self._mock_run(skill_id, params, started)
             emit(Phase("excel_done", label="Excel готов",
@@ -363,7 +390,17 @@ class NotebookRunner:
         csv_path: Optional[Path] = None
         try:
             import pandas as pd
-            df_for_csv = pd.read_excel(excel_path, engine="openpyxl")
+            # Сначала считываем заголовки Excel для динамического определения ID-колонок и сохранения их строкового типа
+            df_headers = pd.read_excel(excel_path, nrows=0, engine="openpyxl")
+            dtype_dict = {}
+            for col in df_headers.columns:
+                col_lower = str(col).lower()
+                if any(x in col_lower for x in ("id", "sid", "key", "номер", "идентификатор")):
+                    if any(x in col_lower for x in ("cnt", "sum", "amt", "val", "кол", "кол-во", "сумма")):
+                        continue
+                    dtype_dict[col] = str
+            
+            df_for_csv = pd.read_excel(excel_path, dtype=dtype_dict, engine="openpyxl")
             csv_path = excel_path.with_suffix(".csv")
             df_for_csv.to_csv(csv_path, index=False, encoding="utf-8-sig")
             logger.info("[NotebookRunner] CSV: %s (%s)",
@@ -438,6 +475,10 @@ class NotebookRunner:
         # Excel-данные (sample для preview + полный df для xlsx)
         data_full, sample_preview = _build_excel_rows(skill_id, rows, begin, end, sid)
         df = pd.DataFrame(data_full)
+        df_cols = list(df.columns)
+        sorted_cols = reorder_columns(df_cols)
+        if sorted_cols != df_cols:
+            df = df[sorted_cols]
         df.to_excel(excel_path, sheet_name="Отчет_ОпРиски", index=False, engine="openpyxl")
         size_bytes = excel_path.stat().st_size
 
@@ -787,6 +828,7 @@ def _build_dossier(sid: str) -> dict:
         "start_dt": "12.03.2025",
         "autoreg": True,
         "risk_profile": "Профиль 8 - Информационная безопасность",
+        "Основной вид рискового события": "RP-08 - Информационная безопасность",
         "type": "Операционные ошибки -> Технические сбои",
         "source": "Система мониторинга -> Автоматическая регистрация",
         "tb": tb_full,
@@ -894,8 +936,7 @@ def _build_narrative(skill_id: str, params: dict, stats: dict) -> str:
         f"В период попало **{rows}** инцидентов.\n"
         f"Общая сумма потерь — **{sum_loss:,.0f} ₽**, возмещения — **{recov:,.0f} ₽** "
         f"({recov_pct}%).\n\n"
-        f"Доминирующий тип — **{tt.get('label','-')}** ({tt.get('pct',0)}%), "
-        f"главный процесс — **{tp.get('label','-')}**.\n\n"
+        f"Основная причина — **{tt.get('label','-')}** ({tt.get('pct',0)}%).\n\n"
         f"📁 Полная выгрузка в Excel."
     ).replace(",", " ")
 

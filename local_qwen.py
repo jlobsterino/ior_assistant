@@ -30,22 +30,58 @@ def call_qwen_isolated(system_prompt, user_message, max_tokens = 50):
         return f"{{'ERROR': {e}}}"
     return None
 
-def ask_local_qwen(messages: list, max_tokens: int = 1500) -> str:
+def ask_local_qwen(messages: list, max_tokens: int = 4096) -> str:
     system_prompt = ""
     user_message = ""
     
+    dialogue_history = []
     for msg in messages:
-        if msg.get("role") == "system":
-            system_prompt = msg.get("content", "")
-        elif msg.get("role") == "user":
-            user_message = msg.get("content", "")
+        role = msg.get("role")
+        content = msg.get("content", "")
+        if role == "system":
+            system_prompt = content
+        elif role == "user":
+            dialogue_history.append(("Пользователь", content))
+        elif role == "assistant":
+            dialogue_history.append(("Ассистент", content))
             
+    if len(dialogue_history) > 1:
+        current_user_query = dialogue_history[-1][1]
+        formatted_history = []
+        for role, text in dialogue_history[:-1]:
+            formatted_history.append(f"{role}: {text}")
+        history_str = "\n".join(formatted_history)
+        user_message = f"История диалога:\n{history_str}\n\nТекущий вопрос пользователя: {current_user_query}"
+    elif dialogue_history:
+        user_message = dialogue_history[0][1]
+        
     result = call_qwen_isolated(system_prompt, user_message, max_tokens)
     
     if result is None:
         return '{"error": "failed"}'
         
     return result
+
+INTENT_CLASSIFIER_PROMPT = """Ты - ИИ-классификатор интентов для чата по инцидентам операционного риска (ИОР).
+Пользователь уже получил выгрузку инцидентов и теперь задает следующий вопрос.
+Твоя задача - определить, требует ли его запрос поиска/фильтрации конкретных инцидентов в локальной базе по ключевым словам/теме, или же это просто продолжение диалога (вопрос по предыдущему ответу, просьба объяснить термин, уточнение, приветствие/спасибо).
+
+Категории:
+- "search": запрос требует поиска/фильтрации конкретных инцидентов, поиска фактов в текстах ИОР, отбора по теме (например: "в каких ИОРах есть хищения?", "найди сбои ПО", "какие инциденты связаны с картами?", "выдели случаи мошенничества").
+- "chat": запрос является продолжением диалога, вопросом по твоему предыдущему ответу, просьбой пояснить термины/слова, мета-вопросом или общим общением (например: "что ты имел в виду под аналитикой?", "поясни второй пункт", "почему ты так решил?", "откуда эти данные?", "привет", "спасибо").
+
+Ответь строго одним словом: "search" или "chat". Не пиши ничего, кроме этого слова.
+"""
+
+def classify_intent_with_qwen(user_query: str) -> str:
+    messages = [
+        {"role": "system", "content": INTENT_CLASSIFIER_PROMPT},
+        {"role": "user", "content": f"Запрос пользователя: \"{user_query}\"\nКатегория:"}
+    ]
+    response = ask_local_qwen(messages, max_tokens=10).strip().lower()
+    if "search" in response:
+        return "search"
+    return "chat"
 
 QWEN_DETAIL_TEMPLATE = """Ты - ИИ-аналитик системы ИОР (Инциденты Операционного Риска). Твоя задача - анализировать предоставленные тексты инцидентов и давать точные ответы на вопросы пользователя, связанные с этими инцидентами.
 
@@ -275,14 +311,17 @@ def answer_detail_with_qwen(user_query: str, ior_texts: str, history: list = Non
         ior_texts=ior_texts
     )
     
-    messages = [
-        {"role": "system", "content": "Ты полезный ИИ-помощник, который отлично анализирует тексты"},
-        {"role": "user", "content": prompt}
-    ]
-    
     if history:
+        messages = [
+            {"role": "system", "content": "Ты полезный ИИ-помощник, который отлично анализирует тексты"}
+        ]
         messages.extend(history)
         messages.append({"role": "user", "content": prompt})
+    else:
+        messages = [
+            {"role": "system", "content": "Ты полезный ИИ-помощник, который отлично анализирует тексты"},
+            {"role": "user", "content": prompt}
+        ]
         
     return ask_local_qwen(messages, max_tokens=1500)
 
@@ -361,14 +400,17 @@ def answer_follow_up_with_qwen(user_query: str, descriptions: list, history: lis
         ior_descriptions=formatted_docs
     )
     
-    messages = [
-        {"role": "system", "content": "Ты полезный ИИ-помощник, который отлично анализирует тексты"},
-        {"role": "user", "content": prompt}
-    ]
-    
     if history:
+        messages = [
+            {"role": "system", "content": "Ты полезный ИИ-помощник, который отлично анализирует тексты"}
+        ]
         messages.extend(history)
         messages.append({"role": "user", "content": prompt})
+    else:
+        messages = [
+            {"role": "system", "content": "Ты полезный ИИ-помощник, который отлично анализирует тексты"},
+            {"role": "user", "content": prompt}
+        ]
         
     response = ask_local_qwen(messages, max_tokens=1500)
     return response

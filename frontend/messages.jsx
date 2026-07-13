@@ -17,7 +17,7 @@ function renderMarkdown(text) {
     } else {
       if (bullets) { blocks.push({ type: 'ul', items: bullets }); bullets = null; }
       if (trimmed === '') {
-        blocks.push({ type: 'br' });
+        continue;
       } else if (line.startsWith('### ')) {
         blocks.push({ type: 'h3', text: line.slice(4) });
       } else if (line.startsWith('## ')) {
@@ -78,9 +78,9 @@ function renderMarkdown(text) {
   return blocks.map((b, i) => {
     if (b.type === 'br') return <br key={i} />;
     if (b.type === 'ul') return <ul key={i}>{b.items.map((it, j) => <li key={j}>{inline(it)}</li>)}</ul>;
-    if (b.type === 'h3') return <h3 key={i} style={{ margin: '16px 0 8px 0', color: 'var(--text-header, #f8fafc)', fontSize: '1.15em', fontWeight: 'bold' }}>{inline(b.text)}</h3>;
-    if (b.type === 'h2') return <h2 key={i} style={{ margin: '20px 0 10px 0', color: 'var(--text-header, #f8fafc)', fontSize: '1.3em', fontWeight: 'bold' }}>{inline(b.text)}</h2>;
-    if (b.type === 'h1') return <h1 key={i} style={{ margin: '24px 0 12px 0', color: 'var(--text-header, #f8fafc)', fontSize: '1.5em', fontWeight: 'bold' }}>{inline(b.text)}</h1>;
+    if (b.type === 'h3') return <h3 key={i} style={{ margin: '16px 0 8px 0', color: 'var(--text-header, inherit)', fontSize: '1.15em', fontWeight: 'bold' }}>{inline(b.text)}</h3>;
+    if (b.type === 'h2') return <h2 key={i} style={{ margin: '20px 0 10px 0', color: 'var(--text-header, inherit)', fontSize: '1.3em', fontWeight: 'bold' }}>{inline(b.text)}</h2>;
+    if (b.type === 'h1') return <h1 key={i} style={{ margin: '24px 0 12px 0', color: 'var(--text-header, inherit)', fontSize: '1.5em', fontWeight: 'bold' }}>{inline(b.text)}</h1>;
     return <p key={i}>{inline(b.text)}</p>;
   });
 }

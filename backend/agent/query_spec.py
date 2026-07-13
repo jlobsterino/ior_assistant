@@ -229,6 +229,269 @@ def classify_range_stage(spec: dict, schema: Schema) -> dict:
             )
     return out
 
+
+def normalize_spec(spec: dict) -> dict:
+    if not isinstance(spec, dict):
+        return spec
+    import copy
+    spec = copy.deepcopy(spec)
+    
+    # 1. Normalize sort
+    if "sort" in spec and isinstance(spec["sort"], list):
+        normalized_sort = []
+        for s in spec["sort"]:
+            if isinstance(s, str):
+                normalized_sort.append({"by": s})
+            elif isinstance(s, dict):
+                normalized_sort.append(s)
+        spec["sort"] = normalized_sort
+        
+    # 2. Normalize source table
+    src = spec.get("source")
+    if not isinstance(src, dict):
+        src = {"table": MAIN_TABLE}
+        spec["source"] = src
+    else:
+        if not src.get("table"):
+            src["table"] = MAIN_TABLE
+            
+    # 3. Normalize joins list
+    joins = src.get("joins") or []
+    if not isinstance(joins, list):
+        joins = []
+    
+    has_fin_impact_join = any(isinstance(j, dict) and j.get("table") == "d6_base_of_knowledge_incident_fin_impact" for j in joins)
+    has_recovery_join = any(isinstance(j, dict) and j.get("table") == "d6_base_of_knowledge_incident_recovery" for j in joins)
+
+    # 4. Auto-rewrite money main column range filters to joins
+    filters = spec.get("filters") or []
+    if isinstance(filters, list):
+        rewritten_filters = []
+        for f in filters:
+            if not isinstance(f, dict):
+                rewritten_filters.append(f)
+                continue
+            f = dict(f)
+            if (f.get("kind") or "").lower() == "range":
+                col = f.get("column")
+                if col in ("incdnt_sum", "incdnt_drct_dmg_sum", "direct_loss_sum", "direct_loss"):
+                    if not has_fin_impact_join:
+                        joins.append({
+                            "table": "d6_base_of_knowledge_incident_fin_impact",
+                            "on": JOIN_KEY,
+                            "how": "left",
+                            "pre_aggregate": {
+                                "group_by": [JOIN_KEY],
+                                "agg": {
+                                    "fin_impact_rub_amt": {
+                                        "fn": "sum",
+                                        "as": "direct_loss",
+                                        "filter": {"fin_impact_type_name": {"eq": "Прямая потеря"}}
+                                    }
+                                }
+                            },
+                            "select": ["direct_loss"]
+                        })
+                        has_fin_impact_join = True
+                    f["column"] = "direct_loss"
+                elif col in ("recovery_rub_amt", "recovery", "recovery_sum"):
+                    if not has_recovery_join:
+                        joins.append({
+                            "table": "d6_base_of_knowledge_incident_recovery",
+                            "on": JOIN_KEY,
+                            "how": "left",
+                            "pre_aggregate": {
+                                "group_by": [JOIN_KEY],
+                                "agg": {
+                                    "recovery_rub_amt": {
+                                        "fn": "sum",
+                                        "as": "recovery"
+                                    }
+                                }
+                            },
+                            "select": ["recovery"]
+                        })
+                        has_recovery_join = True
+                    f["column"] = "recovery"
+            elif (f.get("kind") or "").lower() == "categorical":
+                col = f.get("column")
+                val = f.get("value")
+                if col and isinstance(val, str) and val.strip():
+                    hits = search_values(val, columns=[col], min_score=0.6)
+                    hits_anywhere = search_values(val, min_score=0.6)
+                    
+                    best_col_hit = hits[0] if hits else None
+                    best_any_hit = hits_anywhere[0] if hits_anywhere else None
+                    
+                    # Если есть совпадение в другой колонке, которое существенно надежнее/лучше
+                    if best_any_hit and best_any_hit.column != col:
+                        col_score = best_col_hit.score if best_col_hit else 0.0
+                        if best_any_hit.score > col_score + 0.15 or (col_score < 0.8 and best_any_hit.score >= 0.85):
+                            f["column"] = best_any_hit.column
+                            f["value"] = best_any_hit.value
+                            f["grounded"] = True
+                            rewritten_filters.append(f)
+                            continue
+                            
+                    if best_col_hit:
+                        f["value"] = best_col_hit.value
+                        f["grounded"] = True
+                    elif best_any_hit:
+                        f["column"] = best_any_hit.column
+                        f["value"] = best_any_hit.value
+                        f["grounded"] = True
+            rewritten_filters.append(f)
+        spec["filters"] = rewritten_filters
+
+    # 5. Auto-rewrite money main column metrics to joins
+    agg = spec.get("aggregate")
+    if isinstance(agg, dict) and isinstance(agg.get("metrics"), list):
+        rewritten_metrics = []
+        for m in agg["metrics"]:
+            if not isinstance(m, dict):
+                continue
+            m = dict(m)
+            src_col = m.get("source")
+            if src_col in ("incdnt_sum", "incdnt_drct_dmg_sum", "direct_loss_sum", "direct_loss"):
+                if not has_fin_impact_join:
+                    joins.append({
+                        "table": "d6_base_of_knowledge_incident_fin_impact",
+                        "on": JOIN_KEY,
+                        "how": "left",
+                        "pre_aggregate": {
+                            "group_by": [JOIN_KEY],
+                            "agg": {
+                                "fin_impact_rub_amt": {
+                                    "fn": "sum",
+                                    "as": "direct_loss",
+                                    "filter": {"fin_impact_type_name": {"eq": "Прямая потеря"}}
+                                }
+                            }
+                        },
+                        "select": ["direct_loss"]
+                    })
+                    has_fin_impact_join = True
+                m["source"] = "direct_loss"
+            elif src_col in ("recovery_rub_amt", "recovery", "recovery_sum"):
+                if not has_recovery_join:
+                    joins.append({
+                        "table": "d6_base_of_knowledge_incident_recovery",
+                        "on": JOIN_KEY,
+                        "how": "left",
+                        "pre_aggregate": {
+                            "group_by": [JOIN_KEY],
+                            "agg": {
+                                "recovery_rub_amt": {
+                                    "fn": "sum",
+                                    "as": "recovery"
+                                }
+                            }
+                        },
+                        "select": ["recovery"]
+                    })
+                    has_recovery_join = True
+                m["source"] = "recovery"
+            rewritten_metrics.append(m)
+        agg["metrics"] = rewritten_metrics
+
+    # 6. Auto-rewrite select list
+    select_list = spec.get("select")
+    if isinstance(select_list, list):
+        rewritten_select = []
+        for s in select_list:
+            if s in ("incdnt_sum", "incdnt_drct_dmg_sum", "direct_loss_sum", "direct_loss"):
+                if not has_fin_impact_join:
+                    joins.append({
+                        "table": "d6_base_of_knowledge_incident_fin_impact",
+                        "on": JOIN_KEY,
+                        "how": "left",
+                        "pre_aggregate": {
+                            "group_by": [JOIN_KEY],
+                            "agg": {
+                                "fin_impact_rub_amt": {
+                                    "fn": "sum",
+                                    "as": "direct_loss",
+                                    "filter": {"fin_impact_type_name": {"eq": "Прямая потеря"}}
+                                }
+                            },
+                            "select": ["direct_loss"]
+                        }
+                    })
+                    has_fin_impact_join = True
+                rewritten_select.append("direct_loss")
+            elif s in ("recovery_rub_amt", "recovery", "recovery_sum"):
+                if not has_recovery_join:
+                    joins.append({
+                        "table": "d6_base_of_knowledge_incident_recovery",
+                        "on": JOIN_KEY,
+                        "how": "left",
+                        "pre_aggregate": {
+                            "group_by": [JOIN_KEY],
+                            "agg": {
+                                "recovery_rub_amt": {
+                                    "fn": "sum",
+                                    "as": "recovery"
+                                }
+                            },
+                            "select": ["recovery"]
+                        }
+                    })
+                    has_recovery_join = True
+                rewritten_select.append("recovery")
+            else:
+                rewritten_select.append(s)
+        spec["select"] = rewritten_select
+
+    # 7. Normalize joins and pre_aggregate missing agg
+    normalized_joins = []
+    for j in joins:
+        if not isinstance(j, dict):
+            continue
+        j = dict(j)
+        table_name = j.get("table")
+        if "pre_aggregate" in j:
+            pa = j["pre_aggregate"]
+            if isinstance(pa, dict):
+                pa = dict(pa)
+                if "agg" not in pa or not pa["agg"]:
+                    if table_name == "d6_base_of_knowledge_incident_fin_impact":
+                        agg_filter = {}
+                        filters_list = pa.get("filters") or pa.get("filter") or []
+                        if isinstance(filters_list, dict):
+                            agg_filter = filters_list
+                        elif isinstance(filters_list, list):
+                            for f in filters_list:
+                                if isinstance(f, dict):
+                                    col = f.get("column")
+                                    op = f.get("op") or "eq"
+                                    val = f.get("value")
+                                    if col:
+                                        agg_filter[col] = {op: val}
+                        pa["agg"] = {
+                            "fin_impact_rub_amt": {
+                                "fn": "sum",
+                                "as": "direct_loss",
+                                "filter": agg_filter
+                            }
+                        }
+                        if "select" not in j:
+                            j["select"] = ["direct_loss"]
+                    elif table_name == "d6_base_of_knowledge_incident_recovery":
+                        pa["agg"] = {
+                            "recovery_rub_amt": {
+                                "fn": "sum",
+                                "as": "recovery"
+                            }
+                        }
+                        if "select" not in j:
+                            j["select"] = ["recovery"]
+                j["pre_aggregate"] = pa
+        normalized_joins.append(j)
+    src["joins"] = normalized_joins
+
+    return spec
+
+
 # ----- validate_spec (§2.3) ---------------------------------------------------
 
 def validate_spec(spec: dict, schema: Schema) -> Optional[str]:
@@ -359,20 +622,13 @@ def validate_spec(spec: dict, schema: Schema) -> Optional[str]:
                 return (f"categorical-фильтр {col!r}={f.get('value')!r} без "
                         f"grounded:true. Заземли значение через search_values "
                         f"(граунд категориального обязателен, инвариант 2).")
-            # повторная сверка по ЕДИНОЙ константе GROUND_STRONG (§2.5)
+            # Проверяем, что значение существует в enum_values колонки (если это enum-колонка)
             value = f.get("value")
-            if isinstance(value, str) and value.strip():
-                hits = search_values(value, columns=[col],
-                                     min_score=GROUND_STRONG, top_k=3)
-                if not hits or hits[0].score < GROUND_STRONG:
-                    elsewhere = search_values(value, min_score=GROUND_STRONG, top_k=3)
-                    corr = ""
-                    if elsewhere:
-                        e = elsewhere[0]
-                        corr = (f" Реально найдено в колонке '{e.column}' "
-                                f"(например '{e.value}').")
-                    return (f"categorical {col!r}={value!r} НЕ заземлено "
-                            f"в этой колонке (score<{GROUND_STRONG}).{corr}")
+            t = schema.get(table)
+            col_obj = next((c for c in t.columns if c.name == col), None) if t else None
+            if col_obj and col_obj.enum_values is not None:
+                if value not in col_obj.enum_values:
+                    return f"categorical {col!r}={value!r} не найдено среди допустимых значений этой колонки."
             continue
 
         if kind == "like":
@@ -394,6 +650,8 @@ def validate_spec(spec: dict, schema: Schema) -> Optional[str]:
 
     # --- window/sort/select ссылаются на существующие/деривованные имена —
     for w in (spec.get("window") or []):
+        if not isinstance(w, dict):
+            continue
         for pb in (w.get("partition_by") or []):
             if pb not in known:
                 return f"window.partition_by {pb!r} не найден среди колонок."
@@ -401,7 +659,12 @@ def validate_spec(spec: dict, schema: Schema) -> Optional[str]:
         if ob and ob not in known:
             return f"window.order_by {ob!r} не найден среди колонок."
     for s in (spec.get("sort") or []):
-        by = s.get("by")
+        if isinstance(s, str):
+            by = s
+        elif isinstance(s, dict):
+            by = s.get("by")
+        else:
+            by = None
         if by and by not in known:
             return f"sort.by {by!r} не найден среди колонок."
     for c in (spec.get("select") or []):
@@ -629,14 +892,7 @@ async def compile_query_spec(cctx: CompileContext, spec: dict,
                 except Exception:
                     pass
 
-    # нормализация: source.table по умолчанию = единственная main-таблица
-    if isinstance(spec, dict):
-        spec = dict(spec)
-        src = dict(spec.get("source") or {})
-        src.setdefault("table", MAIN_TABLE)
-        if not src.get("table"):
-            src["table"] = MAIN_TABLE
-        spec["source"] = src
+    spec = normalize_spec(spec)
 
     # --- 0. validate ---
     err = validate_spec(spec, schema)
@@ -865,10 +1121,16 @@ async def compile_query_spec(cctx: CompileContext, spec: dict,
 
     # --- 7. SORT ---
     for s in (spec.get("sort") or []):
+        if isinstance(s, str):
+            s_dict = {"by": s, "desc": False}
+        elif isinstance(s, dict):
+            s_dict = s
+        else:
+            s_dict = {}
         sr = await registry.execute(
             "top_n",
-            {"df_id": cur, "by": s.get("by"),
-             "n": spec.get("limit") or 100_000, "ascending": not s.get("desc", True)},
+            {"df_id": cur, "by": s_dict.get("by"),
+             "n": spec.get("limit") or 100_000, "ascending": not s_dict.get("desc", True)},
             state
         )
         if not sr.ok:
@@ -885,13 +1147,13 @@ async def compile_query_spec(cctx: CompileContext, spec: dict,
         if not spec.get("aggregate"):
             existing_cols = list(state.get_df(cur).columns)
             standard_cols = [
-                "incdnt_sid", "incdnt_id", "incdnt_status_name", "incdnt_autoreg_flag",
+                "incdnt_sid", "incdnt_status_name", "incdnt_autoreg_flag",
                 "incdnt_detection_person_name", "incdnt_source_name", "src_type_lvl_1_name",
                 "src_type_lvl_2_name", "incdnt_type_lvl_1_name", "incdnt_type_lvl_2_name",
                 "incdnt_detection_dt", "incdnt_start_dt", "incdnt_entry_dt",
                 "org_struct_lvl_3_name", "org_struct_lvl_4_name", "process_lvl_4_name",
                 "fin_impact_rub_amt", "direct_loss", "recovery_rub_amt", "recovery", "net_loss",
-                "incdnt_summary_descr_txt", "incdnt_full_descr_txt"
+                "incdnt_summary_descr_txt", "incdnt_full_descr_txt", "incdnt_id"
             ]
             new_sel = list(sel)
             for col in standard_cols:
@@ -907,6 +1169,11 @@ async def compile_query_spec(cctx: CompileContext, spec: dict,
 
     # --- 9. OUTPUT с гардом пустого финального df (§3.8) ---
     final_df = state.get_df(cur)
+    final_cols = list(final_df.columns)
+    sorted_final_cols = reorder_columns(final_cols)
+    if sorted_final_cols != final_cols:
+        cur = state.register_dataframe(final_df[sorted_final_cols], f"select_reorder({cur})", "query_spec.select_reorder").df_id
+        final_df = state.get_df(cur)
     if is_empty_df(final_df):
         _evict(None)
         return CompileResult(
@@ -1015,13 +1282,42 @@ def _apply_derived_metric(state, df_id, dm):
     ).df_id
 
 
+def reorder_columns(cols: list[str]) -> list[str]:
+    new_cols = list(cols)
+    sid_candidates = ["incdnt_sid", "Идентификатор события"]
+    id_candidates = ["incdnt_id", "Идентификационный ключ инцидента операционного риска"]
+    
+    sid_found = None
+    for c in sid_candidates:
+        if c in new_cols:
+            sid_found = c
+            new_cols.remove(c)
+            break
+            
+    id_found = None
+    for c in id_candidates:
+        if c in new_cols:
+            id_found = c
+            new_cols.remove(c)
+            break
+            
+    if sid_found:
+        new_cols.insert(0, sid_found)
+    if id_found:
+        new_cols.append(id_found)
+    return new_cols
+
+
 def _project_columns(state, df_id, select):
     """Оставить в финальном df ТОЛЬКО select-колонки (в их порядке), которые
     реально есть. Если ничего не совпало - возвращаем df_id как есть (не роняем)."""
     df = state.get_df(df_id)
-    keep = [c for c in select if c in df.columns]
-    if not keep or keep == list(df.columns):
+    reordered_select = reorder_columns(select)
+    keep = [c for c in reordered_select if c in df.columns]
+    if not keep:
         return df_id
+    ordered_cols = reorder_columns(list(df.columns))
+    df_ordered = df[ordered_cols] if set(ordered_cols) == set(df.columns) else df[keep]
     return state.register_dataframe(
-        df[keep], f"select({df_id})", "query_spec.select"
+        df_ordered, f"select({df_id})", "query_spec.select"
     ).df_id
