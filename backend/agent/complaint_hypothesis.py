@@ -17,17 +17,49 @@ def _determine_complaint_route(session_id: str) -> str:
     return "analytical"
 
 
-def profile_complaints_dataframe(df: pd.DataFrame) -> str:
+def extract_short_descriptions_summary(df: pd.DataFrame, max_unique: int = 200) -> str:
     """
-    Builds a structured text profile of the retrieved complaints.
-    Includes temporal breakdown and lists the top complaints with their short descriptions 
-    and snippets of the dialogue transcriptions to serve as LLM context.
+    Extracts, normalizes, and tallies short descriptions ('Короткое описание') from the dataset.
+    Returns a frequency table of up to max_unique top short descriptions.
+    """
+    if "Короткое описание" not in df.columns or df["Короткое описание"].dropna().empty:
+        return "Короткие описания отсутствуют."
+    
+    descs = df["Короткое описание"].dropna().astype(str).str.strip()
+    descs = descs[descs != ""]
+    if descs.empty:
+        return "Короткие описания отсутствуют."
+
+    total_count = len(descs)
+    freq_map = {}
+    for d in descs:
+        key = d.lower()
+        if key not in freq_map:
+            freq_map[key] = {"display": d, "count": 0}
+        freq_map[key]["count"] += 1
+    
+    sorted_items = sorted(freq_map.values(), key=lambda x: x["count"], reverse=True)[:max_unique]
+    
+    lines = [f"Частотная статистика коротких описаний (всего проанализировано {total_count} обращений, выведено топ-{len(sorted_items)} уникальных тем):"]
+    for item in sorted_items:
+        cnt = item["count"]
+        pct = (cnt / total_count) * 100
+        lines.append(f"- \"{item['display']}\": {cnt} обращений ({pct:.1f}%)")
+    
+    return "\n".join(lines)
+
+
+def profile_complaints_dataframe(df: pd.DataFrame, df_batch: pd.DataFrame = None, start_rank: int = 1) -> str:
+    """
+    Builds a structured text profile of retrieved complaints.
+    Includes temporal breakdown, SVA metrics summary, short description frequency table (up to 200),
+    and dialogue transcriptions for the current batch of complaints.
     """
     if df.empty:
         return "Таблица обращений пуста."
 
     total_rows = len(df)
-    lines = [f"Профиль данных обращений (Всего найдено: {total_rows} обращений):"]
+    lines = [f"Профиль данных обращений (Всего в базе найдено: {total_rows} обращений):"]
 
     # 1. Temporal breakdown
     if "date" in df.columns:
@@ -45,26 +77,40 @@ def profile_complaints_dataframe(df: pd.DataFrame) -> str:
         except Exception as e:
             logger.warning(f"Ошибка при анализе дат обращений: {e}")
 
-    # 2. Top 10 complaints details
-    lines.append("\nТоп наиболее релевантных обращений для анализа:")
-    top_n = df.head(10)
-    for idx, row in top_n.iterrows():
-        cid = row.get("id", "N/A")
-        desc = row.get("Короткое описание", "—")
-        score = row.get("score", 0.0)
-        date_str = row.get("date", "—")
-        dialogue = row.get("Транскрибация диалога", "—")
+    # 2. SVA metrics breakdown if available
+    if "Метрика СВА" in df.columns:
+        metrics_s = df["Метрика СВА"].dropna()
+        if not metrics_s.empty:
+            m_cnt = metrics_s.value_counts()
+            lines.append("\nРаспределение по метрикам СВА:")
+            for m_code, cnt in m_cnt.items():
+                pct = (cnt / total_rows) * 100
+                lines.append(f"- Метрика '{m_code}': {cnt} обращений ({pct:.1f}%)")
 
-        # Truncate dialogue to prevent context length overflow
-        if isinstance(dialogue, str) and len(dialogue) > 1000:
-            dialogue_snippet = dialogue[:1000] + "..."
-        else:
-            dialogue_snippet = str(dialogue)
+    # 3. Short descriptions frequency table (up to 200 unique)
+    lines.append("\n" + extract_short_descriptions_summary(df, max_unique=200))
 
-        lines.append(f"\n---")
-        lines.append(f"Обращение #{idx+1} (ID: {cid}) | Дата: {date_str} | Скор релевантности: {score:.4f}")
-        lines.append(f"Короткое описание: {desc}")
-        lines.append(f"Транскрибация диалога: {dialogue_snippet}")
+    # 4. Transcriptions for the specified batch
+    target_batch = df_batch if df_batch is not None else df.head(5)
+    if not target_batch.empty:
+        lines.append(f"\nДетальная транскрибация обращений по релевантности (номера {start_rank}-{start_rank + len(target_batch) - 1}):")
+        for idx, (_, row) in enumerate(target_batch.iterrows(), start=start_rank):
+            cid = row.get("id", "N/A")
+            desc = row.get("Короткое описание", "—")
+            score = row.get("score", 0.0)
+            date_str = row.get("date", "—")
+            sva_m = row.get("Метрика СВА", "—")
+            dialogue = row.get("Транскрибация диалога", "—")
+
+            if isinstance(dialogue, str) and len(dialogue) > 1500:
+                dialogue_snippet = dialogue[:1500] + "..."
+            else:
+                dialogue_snippet = str(dialogue)
+
+            lines.append(f"\n---")
+            lines.append(f"Обращение #{idx} (ID: {cid}) | Дата: {date_str} | Скор релевантности: {score:.4f} | Метрика СВА: {sva_m}")
+            lines.append(f"Короткое описание: {desc}")
+            lines.append(f"Транскрибация диалога: {dialogue_snippet}")
 
     return "\n".join(lines)
 
@@ -73,54 +119,144 @@ async def generate_complaint_hypothesis_narrative(user_msg: str, df: pd.DataFram
     """
     Generates a natural language narrative (analytical report with hypotheses)
     about customer complaints using the GigaChat API.
+    
+    Processing Rules:
+    - Short descriptions: Frequency table of up to 200 unique short descriptions.
+    - Transcriptions: Exactly top 10 complaints by relevance, split into 2 batches of 5 (1-5 and 6-10).
+    - Strict Grounding: System instructions strictly enforce no hallucinations, simple logical conclusions,
+      and exact reliance on dates, short descriptions, and dialogue transcripts.
     """
     if df.empty:
         return "По вашему запросу не найдено подходящих обращений в базе данных."
 
-    profile_text = profile_complaints_dataframe(df)
+    from backend.config import get_settings
+    settings = get_settings()
+    delay = settings.gigachat_delay_sec or 7.0
 
-    system_prompt = """Ты — ведущий эксперт-аналитик Службы контроля качества и клиентского опыта Сбербанка.
-Твоя задача — провести глубокий анализ представленных обращений клиентов и сформулировать обоснованные аналитические гипотезы о корневых причинах (root causes) возникновения проблем.
+    system_grounding = """Ты — ведущий эксперт-аналитик Службы контроля качества и клиентского опыта Сбербанка.
+Твоя задача — провести глубокий и объективный анализ обращений клиентов и сформулировать обоснованные аналитические гипотезы о корневых причинах (root causes) возникших проблем.
 
-Аналитическая гипотеза должна не просто пересказывать жалобы клиентов ("клиенты жалуются на кэшбэк"), а выявлять возможные системные сбои, технические ошибки, недостатки в процессах или обучении персонала.
+КРИТИЧЕСКИЕ ПРАВИЛА И ЗАЗЕМЛЕНИЕ (GROUNDING):
+1. Опирайся СТРОГО на предоставленные данные: даты, частотную статистику коротких описаний (частоту повторения тем) и тексты транскрибаций диалогов.
+2. НЕ придумывай вымышленных систем, несуществующих ошибок, внешних факторов или странных фактов, о которых нет сведений в предоставленном контексте.
+3. Делай максимально простые, адекватные и логичные выводы напрямую из переданной информации.
+4. Учитывай хронологию и даты: если проблемы концентрируются в конкретные месяцы/дни, обязательно отраззи это в отчете.
+5. Связывай короткие описания (частые темы) с деталями из транскрибаций диалогов.
 
-Придерживайся следующей структуры отчета:
-
+Структура отчета:
 ### 1. Выявленные проблемы и паттерны
-- Классифицируй жалобы на 2-3 основные группы проблем.
-- Укажи, какие именно аспекты вызывают наибольший негатив (на основе диалогов и описаний).
+- Укажи топ-группы проблем на основе частоты коротких описаний и текстов диалогов.
+- Отметь временную динамику (в какие периоды всплеск обращений).
 
 ### 2. Анализ корневых причин (Root Cause Analysis)
-- Для каждой группы проблем предложи теорию, почему она возникает (например, технический сбой на стороне шлюза, некорректная консультация оператора, баг в обновлении приложения, задержка обработки транзакции).
-- Опирайся на детали из транскрибаций диалогов (например, если оператор долго не мог помочь или система выдавала конкретную ошибку).
+- На основе деталей из транскрибаций предложи простые и реалистичные объяснения корневых причин (например, технический сбой в мобильном приложении, задержка проведения транзакции, неполная информация у оператора).
 
 ### 3. Рекомендации и гипотезы для проверки
-- Сформулируй 2-3 гипотезы с конкретными действиями для проверки. Например:
-  * "Гипотеза о сбое интеграции с партнером X: клиенты не получают баллы при покупках с даты Y. Рекомендация: Проверить логи API-интеграции с партнером."
-  * "Гипотеза о недостаточной информированности поддержки: операторы не знают о новых условиях акции X и дают неверные ответы. Рекомендация: Обновить базу знаний для операторов."
+- Сформулируй 2-3 гипотезы с конкретными действиями для проверки (например: "Гипотеза о сбое PUSH-уведомлений в январе: клиенты не получают смс-коды. Рекомендация: Проверить логи шлюза информирования за указанные даты.").
 
-Пиши на русском языке, в профессиональном, аналитическом стиле. Оперируй только фактами и цифрами из предоставленных данных. Не используй общие фразы.
+Пиши на русском языке, в профессиональном, аналитическом стиле.
 """
 
-    user_prompt = f"""Запрос пользователя: "{user_msg}"
-Файл выгрузки: "{file_info.get('name', 'отчет.xlsx')}" (строк: {len(df)})
+    # Top 10 complaints by relevance for transcription analysis
+    df_top10 = df.head(10)
+
+    # If df has <= 5 complaints total, process in a single batch
+    if len(df_top10) <= 5:
+        profile_text = profile_complaints_dataframe(df, df_batch=df_top10, start_rank=1)
+        user_prompt = f"""Запрос пользователя: "{user_msg}"
+Файл выгрузки: "{file_info.get('name', 'отчет.xlsx')}" (всего обращений в базе: {len(df)})
 
 {profile_text}
 
 Сформулируй гипотезу на основе этих данных. Пиши на русском языке, в профессиональном стиле."""
+        
+        messages = [
+            {"role": "system", "content": system_grounding},
+            {"role": "user", "content": user_prompt}
+        ]
+        try:
+            response = await asyncio.to_thread(def_ask_gigachat, messages)
+            return str(response)
+        except Exception as e:
+            logger.exception(f"Ошибка генерации гипотезы через GigaChat API: {e}")
+            return f"Не удалось сгенерировать гипотезу из-за ошибки: {str(e)}"
 
-    messages = [
-        {"role": "system", "content": system_prompt},
-        {"role": "user", "content": user_prompt}
-    ]
+    # If df has > 5 complaints, process top 10 transcriptions in 2 batches of 5
+    df_batch1 = df_top10.iloc[0:5]
+    df_batch2 = df_top10.iloc[5:10]
 
+    # Batch 1 analysis (transcriptions 1-5)
+    profile1 = profile_complaints_dataframe(df, df_batch=df_batch1, start_rank=1)
+    user_prompt1 = f"""Запрос пользователя: "{user_msg}"
+Группа обращений (топ 1-5 по релевантности) и общая статистика:
+{profile1}
+
+Составь промежуточный аналитический отчет по этой группе обращений."""
+
+    logger.info("[COMPLAINT NARRATIVE] Starting Batch 1 analysis (top 1-5 transcriptions)...")
     try:
-        # Since def_ask_gigachat is synchronous and does network requests, run it in a separate thread
-        response = await asyncio.to_thread(def_ask_gigachat, messages)
-        return str(response)
+        res1 = await asyncio.to_thread(def_ask_gigachat, [
+            {"role": "system", "content": system_grounding},
+            {"role": "user", "content": user_prompt1}
+        ])
     except Exception as e:
-        logger.exception(f"Ошибка генерации гипотезы через GigaChat API: {e}")
-        return f"Не удалось сгенерировать гипотезу из-за ошибки: {str(e)}"
+        logger.error(f"Error in batch 1 analysis: {e}")
+        res1 = f"Ошибка анализа группы 1: {e}"
+
+    # Pause to prevent rate limits
+    logger.info(f"[COMPLAINT NARRATIVE] Pausing for {delay} seconds...")
+    await asyncio.sleep(delay)
+
+    # Batch 2 analysis (transcriptions 6-10 if available)
+    if not df_batch2.empty:
+        profile2 = profile_complaints_dataframe(df, df_batch=df_batch2, start_rank=6)
+        user_prompt2 = f"""Запрос пользователя: "{user_msg}"
+Группа обращений (топ 6-10 по релевантности) и общая статистика:
+{profile2}
+
+Составь промежуточный аналитический отчет по этой группе обращений."""
+
+        logger.info(f"[COMPLAINT NARRATIVE] Starting Batch 2 analysis ({len(df_batch2)} transcriptions)...")
+        try:
+            res2 = await asyncio.to_thread(def_ask_gigachat, [
+                {"role": "system", "content": system_grounding},
+                {"role": "user", "content": user_prompt2}
+            ])
+        except Exception as e:
+            logger.error(f"Error in batch 2 analysis: {e}")
+            res2 = f"Ошибка анализа группы 2: {e}"
+
+        logger.info(f"[COMPLAINT NARRATIVE] Pausing for {delay} seconds before merge...")
+        await asyncio.sleep(delay)
+    else:
+        res2 = "Обращений для группы 2 нет."
+
+    # Merge step
+    user_prompt_combine = f"""Запрос пользователя: "{user_msg}"
+Файл выгрузки: "{file_info.get('name', 'отчет.xlsx')}" (всего обращений в выгрузке: {len(df)})
+
+Общая частотная статистика коротких описаний (топ 200 тем):
+{extract_short_descriptions_summary(df, max_unique=200)}
+
+Промежуточный аналитический отчет 1 (обращения по релевантности 1-5):
+{res1}
+
+Промежуточный аналитический отчет 2 (обращения по релевантности 6-10):
+{res2}
+
+Сформируй единый финальный объединенный аналитический отчет и гипотезы на основе этих данных.
+Соблюдай критические правила: не придумывай фактов, опирайся строго на данные и выводи простые, логичные выводы."""
+
+    logger.info("[COMPLAINT NARRATIVE] Merging batch reports into final hypothesis...")
+    try:
+        final_response = await asyncio.to_thread(def_ask_gigachat, [
+            {"role": "system", "content": system_grounding},
+            {"role": "user", "content": user_prompt_combine}
+        ])
+        return str(final_response)
+    except Exception as e:
+        logger.exception(f"Ошибка при объединении отчетов: {e}")
+        return f"Не удалось объединить промежуточные отчеты из-за ошибки: {e}"
 
 
 def classify_complaint_intent(user_query: str) -> str:
@@ -162,8 +298,8 @@ def search_complaints_cache(query: str, id_to_text_map: dict) -> list:
 
     scored = []
     for cid, item in id_to_text_map.items():
-        desc = item.get("desc", "").lower()
-        dialogue = item.get("dialogue", "").lower()
+        desc = str(item.get("desc") or "").lower()
+        dialogue = str(item.get("dialogue") or "").lower()
         
         score = 0
         for word in words:
@@ -182,7 +318,7 @@ def search_complaints_cache(query: str, id_to_text_map: dict) -> list:
     return [item for score, item in scored[:15]]
 
 
-def answer_complaint_details(user_query: str, complaints: list, history: list = None) -> str:
+def answer_complaint_details(user_query: str, complaints: list, history: list = None, hypothesis: str = None) -> str:
     """
     Answers questions about specific complaints (by ID).
     """
@@ -203,6 +339,8 @@ def answer_complaint_details(user_query: str, complaints: list, history: list = 
 3. Опиши суть проблемы клиента, действия оператора и результат обращения, если они есть.
 4. Пиши в профессиональном стиле, лаконично и четко.
 """
+    if hypothesis:
+        system_prompt += f"\nДля контекста, ранее на основе всей выгрузки была сформирована следующая аналитическая гипотеза:\n{hypothesis}\n"
 
     user_prompt = f"""Вопрос пользователя: "{user_query}"
 
@@ -219,7 +357,7 @@ def answer_complaint_details(user_query: str, complaints: list, history: list = 
     return def_ask_gigachat(messages)
 
 
-def answer_complaint_follow_up(user_query: str, complaints: list, history: list = None) -> str:
+def answer_complaint_follow_up(user_query: str, complaints: list, history: list = None, hypothesis: str = None) -> str:
     """
     Answers general follow-up questions about the entire retrieved set of complaints.
     """
@@ -228,7 +366,6 @@ def answer_complaint_follow_up(user_query: str, complaints: list, history: list 
         cid = item.get("id")
         desc = item.get("desc", "")
         dialogue = item.get("dialogue", "")
-        # Truncate dialogue to keep prompt size reasonable
         if isinstance(dialogue, str) and len(dialogue) > 800:
             dialogue_snippet = dialogue[:800] + "..."
         else:
@@ -243,6 +380,8 @@ def answer_complaint_follow_up(user_query: str, complaints: list, history: list 
 2. Если пользователь спрашивает, на основе чего сделаны выводы, покажи связь между гипотезами и конкретными обращениями (упоминай ID обращений).
 3. Будь предельно объективен, опирайся только на факты из обращений.
 """
+    if hypothesis:
+        system_prompt += f"\nДля контекста, ранее на основе всей выгрузки была сформирована следующая аналитическая гипотеза:\n{hypothesis}\n"
 
     user_prompt = f"""Вопрос пользователя: "{user_query}"
 
@@ -259,7 +398,7 @@ def answer_complaint_follow_up(user_query: str, complaints: list, history: list 
     return def_ask_gigachat(messages)
 
 
-def answer_complaint_dialog(user_query: str, history: list) -> str:
+def answer_complaint_dialog(user_query: str, history: list, hypothesis: str = None) -> str:
     """
     Generates a dialog response using GigaChat, preserving context of the chat session.
     """
@@ -267,10 +406,12 @@ def answer_complaint_dialog(user_query: str, history: list) -> str:
 Ты ведешь диалог с пользователем. Твои ответы должны основываться исключительно на истории сообщений.
 Если тебя просят пояснить понятие, термин или предыдущие выводы, дай развернутое пояснение в профессиональном стиле.
 """
+    if hypothesis:
+        system_prompt += f"\nДля контекста, ранее на основе всей выгрузки была сформирована следующая аналитическая гипотеза:\n{hypothesis}\n"
 
     messages = [{"role": "system", "content": system_prompt}]
-    messages.extend(history)
+    if history:
+        messages.extend(history)
     messages.append({"role": "user", "content": user_query})
 
     return def_ask_gigachat(messages)
-

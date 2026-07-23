@@ -14,7 +14,7 @@ CATEGORICAL_COLS = {
         "org_struct_lvl_5_name", "org_struct_lvl_6_name", "org_struct_lvl_7_name",
         "process_lvl_1_name", "process_lvl_2_name", "process_lvl_3_name", "process_lvl_4_name",
         "funct_block_lvl_2_name", "funct_block_lvl_3_name", "funct_block_lvl_4_name",
-        "risk_profile_name", "incdnt_type_lvl_1_name", "incdnt_type_lvl_2_name",
+        "risk_profile_id", "risk_profile_name", "incdnt_type_lvl_1_name", "incdnt_type_lvl_2_name",
         "incdnt_status_name", "src_type_lvl_1_name", "src_type_lvl_2_name",
         "incdnt_client_type_name", "incdnt_source_name", "incdnt_autoreg_flag"
     ],

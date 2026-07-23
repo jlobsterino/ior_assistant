@@ -964,10 +964,21 @@ async def compile_query_spec(cctx: CompileContext, spec: dict,
 
     # --- 2b. SOURCE query ---
     await _activity("data:source", "Загружаю инциденты", status="active")
+    spec_limit = spec.get("limit")
+    if spec_limit is not None:
+        try:
+            spec_limit_val = int(spec_limit)
+            if spec_limit_val <= 0:
+                spec_limit_val = 100_000
+        except (ValueError, TypeError):
+            spec_limit_val = 100_000
+    else:
+        spec_limit_val = 100_000
+
     res = await registry.execute(
         "query",
         {"table": table, "where": where_main, "columns": main_columns,
-         "limit": spec.get("limit") or 100_000},
+         "limit": spec_limit_val},
         state
     )
     if not res.ok:
@@ -1130,7 +1141,7 @@ async def compile_query_spec(cctx: CompileContext, spec: dict,
         sr = await registry.execute(
             "top_n",
             {"df_id": cur, "by": s_dict.get("by"),
-             "n": spec.get("limit") or 100_000, "ascending": not s_dict.get("desc", True)},
+             "n": spec_limit_val, "ascending": not s_dict.get("desc", True)},
             state
         )
         if not sr.ok:
@@ -1177,10 +1188,8 @@ async def compile_query_spec(cctx: CompileContext, spec: dict,
     if is_empty_df(final_df):
         _evict(None)
         return CompileResult(
-            ok=False, spec_resolved=spec_resolved, lineage=lineage, warnings=warnings,
-            error=("EMPTY_RESULT: после применения фильтров (диапазон/маска/агрегат) "
-                   "строк не осталось - нечего выгружать. Проверьте range-порог / "
-                   "категориальное значение / период, либо честно сообщите пользователю.")
+            ok=True, df_id=cur, file_id=None,
+            spec_resolved=spec_resolved, lineage=lineage, warnings=warnings, funnel=funnel
         )
 
     out = spec.get("output") or {}

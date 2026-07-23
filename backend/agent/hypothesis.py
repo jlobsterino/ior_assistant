@@ -1,4 +1,5 @@
 import os
+import re
 import uuid
 import logging
 import asyncio
@@ -20,6 +21,8 @@ logger = logging.getLogger(__name__)
 
 
 def _to_numeric_clean(series: pd.Series) -> pd.Series:
+    if isinstance(series, pd.DataFrame):
+        series = series.iloc[:, 0]
     if series.empty:
         return series
     if pd.api.types.is_numeric_dtype(series):
@@ -98,7 +101,11 @@ def get_total_and_direct_loss(df: pd.DataFrame) -> tuple[float, float]:
         "incdnt_sum", 
         "общая сумма всех последствий (руб.)", 
         "общая сумма последствий (руб.)", 
-        "сумма последствий, ₽"
+        "сумма последствий, ₽",
+        "fin_impact_rub_amt",
+        "сумма последствия (руб.)",
+        "сумма последствия",
+        "сумма в рублях"
     ]
     for c_cand in total_cols:
         norm_cand = c_cand.lower().strip().replace("–", "-")
@@ -136,49 +143,367 @@ def format_loss(val: float) -> str:
     return f"{val:,.2f} ₽".replace(",", " ")
 
 
-def get_total_and_direct_loss(df: pd.DataFrame) -> tuple[float, float]:
-    total_loss = 0.0
-    direct_loss = 0.0
-    
-    col_map = {str(c).lower().strip().replace("–", "-"): c for c in df.columns}
-    
-    # 1. Total loss column candidates
-    total_cols = [
-        "incdnt_sum", 
-        "общая сумма всех последствий (руб.)", 
-        "общая сумма последствий (руб.)", 
-        "сумма последствий, ₽"
-    ]
-    for c_cand in total_cols:
-        norm_cand = c_cand.lower().strip().replace("–", "-")
-        if norm_cand in col_map:
-            total_loss = _to_numeric_clean(df[col_map[norm_cand]]).sum()
-            break
-    else:
-        money_cols = [c for c in df.columns if any(x in str(c).lower() for x in ("sum", "loss", "dmg", "rub", "amt", "потер", "убыт", "возмещ", "сумм"))]
-        loss_cols = [c for c in money_cols if any(x in str(c).lower() for x in ("loss", "dmg", "потер", "убыт", "sum", "сумм")) and not any(r in str(c).lower() for r in ("rec", "возмещ", "возврат"))]
-        if loss_cols:
-            total_loss = _to_numeric_clean(df[loss_cols[0]]).sum()
+def get_recovery_column(df: pd.DataFrame, running_skill: str = None) -> Optional[str]:
+    if running_skill and "financial_consequences_ior" in running_skill:
+        return None
 
-    # 2. Direct loss column candidates
-    direct_cols = [
-        "incdnt_drct_dmg_sum", 
-        "прямая потеря - итого (руб.)", 
-        "direct_loss", 
-        "прямая потеря"
+    col_map = {str(c).lower().strip().replace("–", "-"): c for c in df.columns}
+    rec_cols_list = [
+        "recovery", 
+        "сумма возмещений", 
+        "сумма возмещения", 
+        "сумма возмещения (руб.)", 
+        "сумма возмещений (руб.)", 
+        "возмещ", 
+        "recovery_rub_amt", 
+        "recovery_rub_amt_aggr", 
+        "сумма возмещения (агрегатор)", 
+        "возмещение - итого по инциденту (руб.)"
     ]
-    for c_cand in direct_cols:
+    for c_cand in rec_cols_list:
         norm_cand = c_cand.lower().strip().replace("–", "-")
         if norm_cand in col_map:
-            direct_loss = _to_numeric_clean(df[col_map[norm_cand]]).sum()
-            break
-    else:
-        type_col = next((c for c in df.columns if str(c).lower() == "fin_impact_type_name"), None)
-        amt_col = next((c for c in df.columns if str(c).lower() == "fin_impact_rub_amt"), None)
-        if type_col and amt_col:
-            direct_loss = _to_numeric_clean(df[df[type_col] == "Прямая потеря"][amt_col]).sum()
+            return col_map[norm_cand]
             
-    return float(total_loss), float(direct_loss)
+    # Fallback to general recovery/возмещ/возврат keywords
+    money_cols = [c for c in df.columns if any(x in str(c).lower() for x in ("sum", "loss", "dmg", "rub", "amt", "потер", "убыт", "возмещ", "сумм"))]
+    rec_cols_fallback = [c for c in money_cols if any(x in str(c).lower() for x in ("rec", "возмещ", "возврат"))]
+    if rec_cols_fallback:
+        return rec_cols_fallback[0]
+        
+    return None
+
+
+def collapse_cyclical_repetitions(text: str) -> str:
+    import re
+    lines = text.split('\n')
+    n = len(lines)
+    if n < 2:
+        return text
+
+    collapsed = []
+    i = 0
+    while i < n:
+        found_cycle = False
+        for k in range(1, 13):
+            if i + 2 * k > n:
+                continue
+            
+            block = [re.sub(r'\s+', ' ', lines[i + j]).strip().lower() for j in range(k)]
+            if not any(block):
+                continue
+                
+            reps = 1
+            while i + (reps + 1) * k <= n:
+                next_block = [re.sub(r'\s+', ' ', lines[i + reps * k + j]).strip().lower() for j in range(k)]
+                if next_block == block:
+                    reps += 1
+                else:
+                    break
+            
+            if reps > 1:
+                for j in range(k):
+                    collapsed.append(lines[i + j])
+                logger.warning(f"Collapsed cyclical repetition: block of size {k} repeated {reps} times.")
+                i += reps * k
+                found_cycle = True
+                break
+        
+        if not found_cycle:
+            collapsed.append(lines[i])
+            i += 1
+            
+    return '\n'.join(collapsed)
+
+
+def normalize_markdown_for_frontend(text: str) -> str:
+    import re
+    lines = text.split('\n')
+    normalized_lines = []
+    for line in lines:
+        stripped = line.strip()
+        # Match ### or #### headers
+        match = re.match(r'^(#{1,5})\s*(.+)$', stripped)
+        if match:
+            content = match.group(2).strip()
+            # If it already ends/starts with **, keep it, else wrap in **
+            if content.startswith("**") and content.endswith("**"):
+                normalized_lines.append(content)
+            else:
+                # Remove trailing colons/periods from bold headers for cleaner look
+                normalized_lines.append(f"**{content}**")
+        elif stripped == "---":
+            # Remove single markdown divider lines completely
+            continue
+        else:
+            normalized_lines.append(line)
+            
+    res = '\n'.join(normalized_lines)
+    return res
+
+
+def collapse_repeated_sentences(text: str) -> tuple[str, int]:
+    import re
+    # First split by line to preserve layout, but also check for identical consecutive non-empty lines
+    lines = text.split('\n')
+    collapsed_lines = []
+    total_reps = 0
+    i = 0
+    n = len(lines)
+    while i < n:
+        line = lines[i]
+        norm_line = re.sub(r'\s+', ' ', line).strip().lower()
+        if not norm_line:
+            collapsed_lines.append(line)
+            i += 1
+            continue
+        
+        j = i + 1
+        while j < n:
+            next_line = lines[j]
+            norm_next = re.sub(r'\s+', ' ', next_line).strip().lower()
+            if norm_next == norm_line:
+                j += 1
+            else:
+                break
+        
+        dup_count = j - i
+        if dup_count > 1:
+            total_reps += (dup_count - 1)
+            logger.warning(f"Detected repetition loop of length {dup_count} for line: '{line}'")
+        collapsed_lines.append(line)
+        i = j
+
+    # Now inside each collapsed line, check for consecutive sentence repetitions
+    final_lines = []
+    for line in collapsed_lines:
+        if not line.strip():
+            final_lines.append(line)
+            continue
+        sentences = re.split(r'(?<=[.!?])\s+', line)
+        collapsed_sentences = []
+        i = 0
+        n = len(sentences)
+        while i < n:
+            s = sentences[i]
+            norm_s = re.sub(r'\s+', ' ', s).strip().lower()
+            if not norm_s:
+                collapsed_sentences.append(s)
+                i += 1
+                continue
+            
+            j = i + 1
+            while j < n:
+                next_s = sentences[j]
+                norm_next = re.sub(r'\s+', ' ', next_s).strip().lower()
+                if norm_next == norm_s:
+                    j += 1
+                else:
+                    break
+            
+            dup_count = j - i
+            if dup_count > 1:
+                total_reps += (dup_count - 1)
+                logger.warning(f"Detected repetition loop of length {dup_count} for sentence: '{s}'")
+            collapsed_sentences.append(s)
+            i = j
+        final_lines.append(" ".join(collapsed_sentences))
+        
+    return "\n".join(final_lines), total_reps
+
+
+def collapse_repeated_sections(text: str) -> str:
+    import re
+    lines = text.split('\n')
+    sections = []
+    current_section = {'header': '', 'norm_header': '', 'lines': []}
+    sections.append(current_section)
+    
+    header_pattern = re.compile(r'^(?:#+\s*|\d+\.\s*)(.+)$')
+    
+    for line in lines:
+        match = header_pattern.match(line.strip())
+        if match:
+            header_text = match.group(1).strip()
+            # Normalize header text: strip non-alphanumeric/spaces, lowercase
+            norm_header = re.sub(r'[^\w\s]', '', header_text).strip().lower()
+            norm_header = re.sub(r'^\d+\s*', '', norm_header).strip()
+            
+            current_section = {'header': line, 'norm_header': norm_header, 'lines': []}
+            sections.append(current_section)
+        else:
+            current_section['lines'].append(line)
+            
+    seen_headers = set()
+    unique_sections = []
+    
+    for sec in sections:
+        norm = sec['norm_header']
+        if not norm:
+            unique_sections.append(sec)
+            continue
+            
+        if norm in seen_headers:
+            logger.warning(f"Detected duplicate section: '{sec['header']}'")
+            continue
+            
+        seen_headers.add(norm)
+        unique_sections.append(sec)
+        
+    result_lines = []
+    for sec in unique_sections:
+        if sec['header']:
+            result_lines.append(sec['header'])
+        result_lines.extend(sec['lines'])
+        
+    return "\n".join(result_lines)
+
+
+def trim_extra_sections(narrative: str, is_summarization: bool) -> str:
+    import re
+    # Find where the last section starts.
+    last_sec_markers = ["### 3.", "3. Концентрация", "3. Выявленные особенности"] if is_summarization else ["### 4.", "4. Аналитические гипотезы", "Аналитические гипотезы"]
+    
+    last_sec_pos = -1
+    for marker in last_sec_markers:
+        pos = narrative.find(marker)
+        if pos != -1:
+            last_sec_pos = pos
+            break
+            
+    if last_sec_pos == -1:
+        return narrative
+        
+    marker_line_end = narrative.find('\n', last_sec_pos)
+    if marker_line_end == -1:
+        return narrative
+        
+    scan_start = marker_line_end
+    text_after = narrative[scan_start:]
+    
+    lines = text_after.split('\n')
+    cut_idx = -1
+    
+    plain_header_pattern = re.compile(r'^[А-ЯA-Z\d][^\n]{1,100}$')
+    list_item_pattern = re.compile(r'^\s*[•\-\*\d+\.]\s')
+    
+    blacklist_headers = ["следующие шаги", "финальный вывод", "выводы", "рекомендации", "дополнительно", "заключение", "итоги", "резюме", "вывод"]
+    
+    for idx, line in enumerate(lines):
+        striped_line = line.strip()
+        if not striped_line:
+            continue
+            
+        # Check if it is a markdown heading (but not #### if it's subheadings of hypothesis)
+        if striped_line.startswith('#') and not striped_line.startswith('####'):
+            cut_idx = idx
+            break
+            
+        # Check blacklist headings (case-insensitive, strip punctuation)
+        norm_line = re.sub(r'[^\w\s]', '', striped_line).strip().lower()
+        if norm_line in blacklist_headers:
+            cut_idx = idx
+            break
+            
+        # Check plain text heading followed by bullet points
+        if plain_header_pattern.match(striped_line):
+            next_idx = idx + 1
+            while next_idx < len(lines) and not lines[next_idx].strip():
+                next_idx += 1
+            if next_idx < len(lines):
+                next_line = lines[next_idx].strip()
+                if list_item_pattern.match(next_line):
+                    cut_idx = idx
+                    break
+                    
+    if cut_idx != -1:
+        trimmed_after = "\n".join(lines[:cut_idx])
+        return narrative[:scan_start] + trimmed_after
+        
+    return narrative
+
+
+async def validate_narrative(narrative: str, forbidden_fields: list[str] = None) -> dict:
+    import json
+    import re
+    
+    # Base system prompt with common rules
+    system_prompt = (
+        "Ты — контролёр качества аналитических отчётов. Проверь предоставленный текст на следующие нарушения правил и верни ТОЛЬКО JSON без пояснений:\n"
+        "{\n"
+        "  \"autoreg_criticized\": bool, \n"
+        "  \"hypotheses_duplicate\": bool, \n"
+        "  \"extra_sections\": bool, \n"
+        "  \"missing_eve_ids_in_major_incidents\": bool, \n"
+        "  \"fabricated_thresholds\": bool, \n"
+        "  \"numbers_inconsistent\": bool, \n"
+        "  \"unfounded_inference_from_null_data\": bool, \n"
+        "  \"fields_not_in_dataset\": bool, \n"
+        "  \"details\": \"краткое описание найденных проблем на русском\"\n"
+        "}\n\n"
+        "КРИТЕРИИ НАРУШЕНИЙ:\n"
+        "1. autoreg_criticized: критикуется ли авторегистрация (авторег) как негативный фактор, или утверждается, что высокая доля авторегистрации — это проблема/уязвимость.\n"
+        "2. hypotheses_duplicate: дублируют ли гипотезы друг друга по смыслу или сводятся ли они к одной причине (например, все гипотезы утверждают, что 'виноват персонал').\n"
+        "3. extra_sections: содержит ли отчет разделы, выходящие за рамки разрешенной структуры (например, разделы 'Вывод', 'Заключение', 'Финальный вывод', 'Следующие шаги', 'Рекомендации').\n"
+        "4. missing_eve_ids_in_major_incidents: отсутствуют ли конкретные ID инцидентов (EVE-XXXXXXX) при описании крупных инцидентов или концентрации потерь.\n"
+        "5. fabricated_thresholds: присутствуют ли в шагах проверки гипотез надуманные/вымышленные числовые пороги подтверждения (например, '>30%', '>50%'), не подтвержденные данными.\n"
+        "6. numbers_inconsistent: противоречат ли друг другу числовые показатели в разных частях отчета (например, разное количество инцидентов или разные суммы для одного среза данных).\n"
+        "7. unfounded_inference_from_null_data: делаются ли необоснованные причинно-следственные выводы из нулевых или вырожденных значений метрик (например, 'нулевые потери означают урегулированность всех ошибок')."
+    )
+
+    if forbidden_fields:
+        fields_str = ", ".join(f"'{f}'" for f in forbidden_fields)
+        system_prompt += (
+            f"\n8. fields_not_in_dataset: присутствуют ли в отчете числовые значения или явные упоминания сумм/процентов/метрик "
+            f"по полям {fields_str}, которых заведомо НЕТ в данном типе выгрузки (например, возмещения в выгрузке финансовых последствий)."
+        )
+    else:
+        system_prompt += "\n8. fields_not_in_dataset: false (всегда false, так как список запрещенных полей пуст)."
+    
+    user_message = f"Проверь следующий отчет:\n\n{narrative}"
+    
+    from local_qwen import ask_local_qwen
+    try:
+        response_text = await asyncio.to_thread(
+            ask_local_qwen, [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_message}
+            ],
+            max_tokens=768
+        )
+        
+        text = str(response_text).strip()
+        if text.startswith("```"):
+            lines = text.splitlines()
+            if lines[0].startswith("```"):
+                lines = lines[1:]
+            if lines and lines[-1].startswith("```"):
+                lines = lines[:-1]
+            text = "\n".join(lines).strip()
+            
+        try:
+            return json.loads(text)
+        except json.JSONDecodeError:
+            match = re.search(r'\{.*\}', text, re.DOTALL)
+            if match:
+                try:
+                    return json.loads(match.group(0))
+                except json.JSONDecodeError:
+                    pass
+    except Exception as e:
+        logger.error(f"Error in validate_narrative: {e}")
+        
+    return {
+        "autoreg_criticized": False,
+        "hypotheses_duplicate": False,
+        "extra_sections": False,
+        "missing_eve_ids_in_major_incidents": False,
+        "fabricated_thresholds": False,
+        "numbers_inconsistent": False,
+        "unfounded_inference_from_null_data": False,
+        "fields_not_in_dataset": False,
+        "details": "Ошибка парсинга ответа судьи"
+    }
 
 
 def calculate_advanced_stats(df: pd.DataFrame) -> dict:
@@ -236,14 +561,26 @@ def generate_dynamics_chart(df: pd.DataFrame, session_id: str) -> Optional[str]:
             logger.info("No date column found, skipping chart generation.")
             return None
             
-        money_cols = [c for c in df.columns if any(x in str(c).lower() for x in ("sum", "loss", "dmg", "rub", "amt", "потер", "убыт", "возмещ", "сумм"))]
-        loss_cols = [c for c in money_cols if any(x in str(c).lower() for x in ("loss", "dmg", "потер", "убыт", "sum")) and "rec" not in str(c).lower()]
-        if not loss_cols and money_cols:
-            loss_cols = [c for c in money_cols if not any(x in str(c).lower() for x in ("rec", "возмещ", "возврат"))]
-        recovery_cols = [c for c in money_cols if any(x in str(c).lower() for x in ("rec", "возмещ"))]
+        # Try exact matching first for translated columns
+        loss_candidates = ["общая сумма всех последствий (руб.)", "общая сумма последствий (руб.)", "сумма последствий, ₽", "сумма последствий", "incdnt_sum", "incdnt_drct_dmg_sum", "сумма последствия (руб.)", "сумма последствия", "fin_impact_rub_amt"]
+        rec_candidates = ["возмещение – итого по инциденту (руб.)", "сумма возмещений (руб.)", "сумма возмещений", "возмещ", "recovery", "recovery_rub_amt_aggr", "recovery_rub_amt", "сумма возмещения (руб.)"]
         
-        primary_loss = loss_cols[0] if loss_cols else None
-        primary_recovery = recovery_cols[0] if recovery_cols else None
+        primary_loss = next((c for c in df.columns if str(c).lower().strip() in loss_candidates), None)
+        primary_recovery = next((c for c in df.columns if str(c).lower().strip() in rec_candidates), None)
+        
+        if not primary_loss:
+            money_cols = [c for c in df.columns if any(x in str(c).lower() for x in ("sum", "loss", "dmg", "rub", "amt", "потер", "убыт", "возмещ", "сумм", "потери"))]
+            loss_cols = [c for c in money_cols if any(x in str(c).lower() for x in ("loss", "dmg", "потер", "убыт", "sum", "потери")) and not any(r in str(c).lower() for r in ("rec", "возмещ", "возврат", "возмещений"))]
+            if loss_cols:
+                primary_loss = loss_cols[0]
+            elif money_cols:
+                primary_loss = [c for c in money_cols if not any(r in str(c).lower() for r in ("rec", "возмещ", "возврат", "возмещений"))][0]
+                
+        if not primary_recovery:
+            money_cols = [c for c in df.columns if any(x in str(c).lower() for x in ("sum", "loss", "dmg", "rub", "amt", "потер", "убыт", "возмещ", "сумм", "потери"))]
+            recovery_cols = [c for c in money_cols if any(x in str(c).lower() for x in ("rec", "возмещ", "возврат", "возмещений"))]
+            if recovery_cols:
+                primary_recovery = recovery_cols[0]
         
         # Prepare data
         temp_df = df.copy()
@@ -308,24 +645,35 @@ def generate_dynamics_chart(df: pd.DataFrame, session_id: str) -> Optional[str]:
         periods = grouped['period_key'].astype(str).tolist()
         counts = grouped['count'].tolist()
         
-        # Set max ticks limit for horizontal x-axis readability
-        ax1.xaxis.set_major_locator(plt.MaxNLocator(12))
-        
         # Bar 1: incident counts (primary y-axis, clean sky blue color)
         bar_width = 0.35
-        x_positions = range(len(periods))
+        n_periods = len(periods)
+        x_positions = list(range(n_periods))
         ax1.bar(x_positions, counts, width=bar_width, color='#3b82f6', edgecolor='#2563eb', alpha=0.85, label='Число инцидентов')
         ax1.set_ylabel('Число инцидентов', color='#1e3a8a', fontsize=10)
         ax1.tick_params(axis='y', labelcolor='#1e3a8a', colors='#0f172a')
-        ax1.set_xticks(x_positions)
-        ax1.set_xticklabels(periods, rotation=15, ha='right', fontsize=8, color='#0f172a')
+        
+        # Handle custom tick label density to avoid date overlap
+        if n_periods > 12:
+            step = (n_periods // 12) + 1
+            tick_positions = list(range(0, n_periods, step))
+            tick_labels = [periods[i] for i in tick_positions]
+        else:
+            tick_positions = x_positions
+            tick_labels = periods
+            
+        ax1.set_xticks(tick_positions)
+        ax1.set_xticklabels(tick_labels, rotation=15, ha='right', fontsize=8, color='#0f172a')
         
         # Hide borders
         for spine in ax1.spines.values():
             spine.set_edgecolor('#cbd5e1')
             
         # Optional lines on secondary axis for losses/recoveries
-        if primary_loss and grouped['loss_sum'].sum() > 0:
+        has_losses = primary_loss and grouped['loss_sum'].sum() > 0
+        has_recoveries = primary_recovery and grouped['recovery_sum'].sum() > 0
+        
+        if has_losses or has_recoveries:
             ax2 = ax1.twinx()
             ax2.set_facecolor('none')  # Make background transparent
             
@@ -347,14 +695,22 @@ def generate_dynamics_chart(df: pd.DataFrame, session_id: str) -> Optional[str]:
             ax2.spines['right'].set_color('#94a3b8')
             
             # Line 2: losses (rose color)
-            ax2.plot(periods, losses_scaled, color='#dc2626', marker='s', markersize=4, linewidth=2, label=f'Сумма потерь ({denom_label})')
+            if has_losses:
+                ax2.plot(x_positions, losses_scaled, color='#dc2626', marker='s', markersize=4, linewidth=2, label=f'Сумма потерь ({denom_label})')
             
             # Line 3: recoveries (green color)
-            if primary_recovery and grouped['recovery_sum'].sum() > 0:
-                ax2.plot(periods, recoveries_scaled, color='#15803d', marker='^', markersize=4, linewidth=1.8, linestyle='--', label=f'Сумма возмещений ({denom_label})')
+            if has_recoveries:
+                ax2.plot(x_positions, recoveries_scaled, color='#15803d', marker='^', markersize=4, linewidth=1.8, linestyle='--', label=f'Сумма возмещений ({denom_label})')
                 
-            ax2.set_ylabel(f'Объем средств ({denom_label})', color='#dc2626', fontsize=10)
-            ax2.tick_params(axis='y', labelcolor='#dc2626', colors='#0f172a')
+            y2_label = []
+            if has_losses:
+                y2_label.append("потерь")
+            if has_recoveries:
+                y2_label.append("возмещений")
+            label_text = f"Объем {' и '.join(y2_label)} ({denom_label})"
+            
+            ax2.set_ylabel(label_text, color='#dc2626' if has_losses else '#15803d', fontsize=10)
+            ax2.tick_params(axis='y', labelcolor='#dc2626' if has_losses else '#15803d', colors='#0f172a')
             
             # Combine legends
             lines1, labels1 = ax1.get_legend_handles_labels()
@@ -527,7 +883,7 @@ def generate_distribution_chart(df: pd.DataFrame, session_id: str) -> Optional[s
         return None
 
 
-def profile_dataframe(df: pd.DataFrame) -> str:
+def profile_dataframe(df: pd.DataFrame, running_skill: str = None) -> str:
     """
     Generates a Markdown profile of the dataframe.
     """
@@ -538,6 +894,7 @@ def profile_dataframe(df: pd.DataFrame) -> str:
     lines = [f"### Профиль данных выгрузки (Всего строк для анализа: {total_rows}):\n"]
 
     df_copy = df.copy()
+    is_nonfinancial = (running_skill == "ior_nonfinancial_consequences")
     reason_col = next((c for c in df_copy.columns if str(c).lower() in ("incdnt_type_lvl_1_name", "тип события – уровень 1", "тип события - уровень 1")), None)
     if reason_col:
         df_copy = df_copy.rename(columns={reason_col: "Основная причина"})
@@ -552,55 +909,58 @@ def profile_dataframe(df: pd.DataFrame) -> str:
             pass
 
     # 1. Money/Loss summaries
-    money_cols = [c for c in df_copy.columns if any(x in str(c).lower() for x in ("sum", "loss", "dmg", "rub", "amt", "потер", "убыт", "возмещ", "сумм"))]
-    loss_cols = [c for c in money_cols if any(x in str(c).lower() for x in ("loss", "dmg", "потер", "убыт", "sum", "сумм")) and not any(r in str(c).lower() for r in ("rec", "возмещ", "возврат"))]
-    if not loss_cols and money_cols:
-        loss_cols = [c for c in money_cols if not any(x in str(c).lower() for x in ("rec", "возмещ", "возврат"))]
-    rec_cols = [c for c in money_cols if "rec" in str(c).lower() or "возмещ" in str(c).lower() or "возврат" in str(c).lower()]
-
-    # Locate specific key columns for side-by-side comparison
+    money_cols = []
     incdnt_sum_col = None
     recovery_col = None
-    for col in df_copy.columns:
-        col_lower = str(col).lower()
-        if any(x in col_lower for x in ("incdnt_sum", "общая сумма", "сумма последствий")) and not any(x in col_lower for x in ("rec", "возмещ", "возврат")):
-            incdnt_sum_col = col
-        elif any(x in col_lower for x in ("recovery", "возмещ", "возврат")):
-            recovery_col = col
-
-    if incdnt_sum_col is None and loss_cols:
-        for c in loss_cols:
-            if "incdnt_sum" in str(c).lower() or "общая сумма" in str(c).lower():
-                incdnt_sum_col = c
-                break
-        if incdnt_sum_col is None:
-            incdnt_sum_col = loss_cols[0]
-
-    if recovery_col is None and rec_cols:
-        recovery_col = rec_cols[0]
-
     total_loss = 0.0
     total_rec = 0.0
 
-    if incdnt_sum_col is not None:
-        try:
-            total_loss = _to_numeric_clean(df_copy[incdnt_sum_col]).sum()
-            lines.append(f"- **Общая сумма всех последствий (incdnt_sum)**: {format_loss(total_loss)} (по колонке '{incdnt_sum_col}')")
-        except Exception as e:
-            logger.warning(f"Error summing loss: {e}")
+    if not is_nonfinancial:
+        money_cols = [c for c in df_copy.columns if any(x in str(c).lower() for x in ("sum", "loss", "dmg", "rub", "amt", "потер", "убыт", "возмещ", "сумм"))]
+        loss_cols = [c for c in money_cols if any(x in str(c).lower() for x in ("loss", "dmg", "потер", "убыт", "sum", "сумм")) and not any(r in str(c).lower() for r in ("rec", "возмещ", "возврат"))]
+        if not loss_cols and money_cols:
+            loss_cols = [c for c in money_cols if not any(x in str(c).lower() for x in ("rec", "возмещ", "возврат"))]
+        rec_cols = [c for c in money_cols if "rec" in str(c).lower() or "возмещ" in str(c).lower() or "возврат" in str(c).lower()]
 
-    if recovery_col is not None:
-        try:
-            total_rec = _to_numeric_clean(df_copy[recovery_col]).sum()
-            lines.append(f"- **Сумма возмещений (recovery)**: {format_loss(total_rec)} (по колонке '{recovery_col}')")
-        except Exception as e:
-            logger.warning(f"Error summing recovery: {e}")
+        # Locate specific key columns for side-by-side comparison
+        incdnt_sum_col = None
+        for col in df_copy.columns:
+            col_lower = str(col).lower()
+            if any(x in col_lower for x in ("incdnt_sum", "общая сумма", "сумма последствий")) and not any(x in col_lower for x in ("rec", "возмещ", "возврат")):
+                incdnt_sum_col = col
 
-    if incdnt_sum_col is not None and recovery_col is not None:
-        lines.append(f"- **Чистые потери (Net Loss)**: {format_loss(total_loss - total_rec)}")
+        if incdnt_sum_col is None and loss_cols:
+            for c in loss_cols:
+                if "incdnt_sum" in str(c).lower() or "общая сумма" in str(c).lower():
+                    incdnt_sum_col = c
+                    break
+            if incdnt_sum_col is None:
+                incdnt_sum_col = loss_cols[0]
 
-    if total_loss == 0:
-        lines.append("\n> [!NOTE]\n> Данные по потерям отсутствуют (равны нулю). В анализе и гипотезах сфокусируйся на других метриках (количестве инцидентов, динамике регистраций, распределении по категориям/ТБ, доле авторегистрации). Не зацикливайся на нулевых потерях.")
+        recovery_col = get_recovery_column(df_copy, running_skill)
+
+        total_loss = 0.0
+        total_rec = 0.0
+
+        if incdnt_sum_col is not None:
+            try:
+                total_loss = _to_numeric_clean(df_copy[incdnt_sum_col]).sum()
+                lines.append(f"- **Общая сумма всех последствий (incdnt_sum)**: {format_loss(total_loss)} (по колонке '{incdnt_sum_col}')")
+            except Exception as e:
+                logger.warning(f"Error summing loss: {e}")
+
+        if recovery_col is not None:
+            try:
+                total_rec = _to_numeric_clean(df_copy[recovery_col]).sum()
+                lines.append(f"- **Сумма возмещений (recovery)**: {format_loss(total_rec)} (по колонке '{recovery_col}')")
+            except Exception as e:
+                logger.warning(f"Error summing recovery: {e}")
+
+        if incdnt_sum_col is not None and recovery_col is not None:
+            lines.append(f"- **Чистые потери (Net Loss)**: {format_loss(total_loss - total_rec)}")
+
+        if total_loss == 0:
+            lines.append("\n> [!NOTE]\n> Данные по потерям отсутствуют (равны нулю). В анализе и гипотезах сфокусируйся на других метриках (количестве инцидентов, динамике регистраций, распределении по категориям/ТБ, доле авторегистрации). Не зацикливайся на нулевых потерях.")
 
     # 2. Date/Temporal analysis
     entry_candidates = [c for c in df_copy.columns if any(x in str(c).lower() for x in ("entry", "ввод", "регистр"))
@@ -705,7 +1065,20 @@ def profile_dataframe(df: pd.DataFrame) -> str:
                 # Sort by count descending
                 sorted_grp = sorted(grp, key=lambda x: len(x[1]), reverse=True)
                 
-                lines.append(f"\n**Показатели по колонке '{col}' (Топ-5):**")
+                is_status_history_col = False
+                if running_skill == "deleted_ior":
+                    col_lower = str(col).lower()
+                    if any(x in col_lower for x in ("status", "статус", "stts_chng", "stts")):
+                        # check if there are values other than "удален", "удалён"
+                        unique_vals = df_copy[col].dropna().unique()
+                        unique_vals_lower = [str(v).lower().strip() for v in unique_vals]
+                        if any(v not in ("удален", "удалён") for v in unique_vals_lower):
+                            is_status_history_col = True
+
+                if is_status_history_col:
+                    lines.append(f"\n**Показатели по колонке '{col}' (Топ-5) [статусы, которые инцидент проходил ДО удаления]:**")
+                else:
+                    lines.append(f"\n**Показатели по колонке '{col}' (Топ-5):**")
                 lines.append("| Значение | Число инцидентов | % от общего | Сумма потерь | % потерь |")
                 lines.append("|---|---|---|---|---|")
                 
@@ -811,11 +1184,11 @@ def profile_dataframe(df: pd.DataFrame) -> str:
 async def analyze_incident_descriptions(df: pd.DataFrame) -> str:
     """
     Batches incident descriptions to prevent LLM context window overflows.
-    Uses async local Qwen analysis for summaries.
+    Uses async local Qwen analysis for summaries (top 60, 3 batches of 20).
     """
     import re
     # Locate column names
-    loss_cols = ["incdnt_sum", "Общая сумма всех последствий (руб.)", "Общая сумма последствий (руб.)"]
+    loss_cols = ["incdnt_sum", "Общая сумма всех последствий (руб.)", "Общая сумма последствий (руб.)", "Сумма последствий, ₽"]
     primary_loss = next((c for c in loss_cols if c in df.columns), None)
     if not primary_loss:
         money_cols = [c for c in df.columns if any(x in str(c).lower() for x in ("sum", "loss", "dmg", "rub", "amt", "потер", "убыт", "возмещ", "сумм"))]
@@ -829,20 +1202,18 @@ async def analyze_incident_descriptions(df: pd.DataFrame) -> str:
     full_desc_col = next((c for c in df.columns if str(c).lower() in ("incdnt_full_descr_txt", "подробное описание", "полное описание", "описание")), None)
     sum_desc_col = next((c for c in df.columns if str(c).lower() in ("incdnt_summary_descr_txt", "краткое описание", "аннотация")), None)
     
-    if not primary_loss:
-        return ""
+    df_sorted = df.copy()
+    if primary_loss:
+        df_sorted[primary_loss] = _to_numeric_clean(df_sorted[primary_loss])
+        df_sorted = df_sorted.sort_values(by=primary_loss, ascending=False)
         
-    df_with_loss = df.copy()
-    df_with_loss[primary_loss] = _to_numeric_clean(df_with_loss[primary_loss])
-    df_with_loss = df_with_loss.dropna(subset=[primary_loss])
-    
     descriptions = []
     
-    # Extract top 30 largest incidents by loss
-    top_30_df = df_with_loss.sort_values(by=primary_loss, ascending=False).head(30)
+    # Extract top 30 largest incidents
+    top_30_df = df_sorted.head(30)
     for _, row in top_30_df.iterrows():
-        sid = row[primary_id] if primary_id else "—"
-        val = row[primary_loss]
+        sid = row[primary_id] if primary_id and primary_id in row else "—"
+        val = row[primary_loss] if primary_loss and primary_loss in row else 0.0
         desc = ""
         # Prefer full description, fallback to summary description
         if full_desc_col and full_desc_col in row and pd.notna(row[full_desc_col]) and str(row[full_desc_col]).strip():
@@ -856,26 +1227,32 @@ async def analyze_incident_descriptions(df: pd.DataFrame) -> str:
                 desc = str(row[desc_fallback_col]).strip()
                 
         if desc:
-            descriptions.append(f"Инцидент {sid} (Сумма потерь: {format_loss(val)}): {desc}")
+            loss_str = f" (Сумма потерь: {format_loss(val)})" if val > 0 else ""
+            descriptions.append(f"Идентификатор: {sid}{loss_str} | Описание: {desc}")
             
     if not descriptions:
         return ""
         
-    # Split into exactly 2 batches
-    batch_size = (len(descriptions) + 1) // 2
-    batch_1 = descriptions[:batch_size]
-    batch_2 = descriptions[batch_size:]
+    # Split into exactly 3 batches of at most 10 items
+    batch_1 = descriptions[:10]
+    batch_2 = descriptions[10:20]
+    batch_3 = descriptions[20:30]
     
     from local_qwen import ask_local_qwen
     
     async def analyze_batch(batch_items, batch_num):
         if not batch_items:
-            return "Нет данных по этому пакету."
-        prompt = f"Ниже представлены описания крупных инцидентов операционного риска (Пакет {batch_num}). Выдели ключевые технические и системные проблемы:\n" + "\n".join(batch_items)
+            return ""
+        prompt = (
+            f"Ниже представлены описания крупных инцидентов операционного риска (Пакет {batch_num}). "
+            f"Для каждого инцидента подготовь краткую выжимку (1-2 предложения), объясняющую суть произошедшего. "
+            f"Обязательно сохрани связь с Идентификатором инцидента.\n\n"
+            + "\n".join(batch_items)
+        )
         try:
             res = await asyncio.to_thread(
                 ask_local_qwen, [
-                    {"role": "system", "content": "Ты — аналитик Службы внутреннего аудита. Подготовь краткое структурированное резюме технических и системных причин инцидентов в 1-2 абзацах, используя строго нейтральный деловой язык."},
+                    {"role": "system", "content": "Ты — аналитик Службы внутреннего аудита. Опиши суть каждого инцидента строго индивидуально, в формате 'Идентификатор: [краткая суть]'. Пиши нейтральным деловым языком. Не делай общих выводов."},
                     {"role": "user", "content": prompt}
                 ],
                 max_tokens=1024
@@ -883,109 +1260,118 @@ async def analyze_incident_descriptions(df: pd.DataFrame) -> str:
             return str(res)
         except Exception as e:
             logger.error(f"Error analyzing descriptions batch {batch_num}: {e}")
-            return f"Ошибка при анализе пакета {batch_num}: {e}"
+            return ""
             
-    summary_1, summary_2 = await asyncio.gather(
+    results = await asyncio.gather(
         analyze_batch(batch_1, 1),
-        analyze_batch(batch_2, 2)
+        analyze_batch(batch_2, 2),
+        analyze_batch(batch_3, 3)
     )
     
-    combined = (
-        f"### Результаты анализа описаний инцидентов (Пакет 1):\n{summary_1}\n\n"
-        f"### Результаты анализа описаний инцидентов (Пакет 2):\n{summary_2}\n"
+    combined = []
+    if results[0]:
+        combined.append(f"### Результаты анализа описаний инцидентов (Пакет 1):\n{results[0]}")
+    if results[1]:
+        combined.append(f"### Результаты анализа описаний инцидентов (Пакет 2):\n{results[1]}")
+    if results[2]:
+        combined.append(f"### Результаты анализа описаний инцидентов (Пакет 3):\n{results[2]}")
+        
+    return "\n\n".join(combined)
+
+
+def get_running_skill_id(df: pd.DataFrame, session_id: str) -> Optional[str]:
+    try:
+        from backend.agent.state import get_session_state
+        state = get_session_state(session_id)
+        # 1. Identity match
+        for df_id, meta in state.dataframe_meta.items():
+            stored_df = state.dataframes.get(df_id)
+            if stored_df is df:
+                created_by = meta.created_by
+                if created_by.startswith("run_preset:"):
+                    return created_by.split(":", 1)[1]
+        # 2. Fallback: columns and length match
+        for df_id, meta in state.dataframe_meta.items():
+            stored_df = state.dataframes.get(df_id)
+            if stored_df is not None and len(stored_df) == len(df) and list(stored_df.columns) == list(df.columns):
+                created_by = meta.created_by
+                if created_by.startswith("run_preset:"):
+                    return created_by.split(":", 1)[1]
+        # 3. Fallback: check last dataframe meta
+        if state.dataframe_meta:
+            last_meta = list(state.dataframe_meta.values())[-1]
+            if last_meta.created_by.startswith("run_preset:"):
+                return last_meta.created_by.split(":", 1)[1]
+    except Exception as e:
+        logger.warning(f"Error determining running skill_id: {e}")
+    return None
+
+
+async def summarize_deletion_comments(comments: list[str]) -> str:
+    if not comments:
+        return ""
+    unique_comments = list(set(comments))[:300]
+    prompt = (
+        "Ниже представлены комментарии сотрудников об основаниях и причинах удаления инцидентов операционного риска.\n"
+        "Проанализируй их и подготовь краткое структурированное резюме наиболее популярных причин удаления (например, дубликаты, сбои АС, ошибки ввода), "
+        "используя строго нейтральный деловой язык. Не упоминай точное количество проанализированных комментариев:\n\n"
+        + "\n".join(f"- {c}" for c in unique_comments)
     )
-    return combined
+    from local_qwen import ask_local_qwen
+    try:
+        res = await asyncio.to_thread(
+            ask_local_qwen, [
+                {"role": "system", "content": "Ты — аналитик Службы внутреннего аудита. Проведи анализ комментариев о причинах удаления инцидентов и выдели ключевые системные или операционные причины удаления."},
+                {"role": "user", "content": prompt}
+            ],
+            max_tokens=1024
+        )
+        return str(res)
+    except Exception as e:
+        logger.error(f"Error summarizing deletion comments: {e}")
+        return f"Ошибка при анализе комментариев удаления: {e}"
 
 
 async def generate_hypothesis_narrative(user_msg: str, df: pd.DataFrame, file_info: dict, session_id: str) -> str:
     """
     Generates a natural language narrative (with hypothesis / insights) based on the dataframe profile and optional plot.
     """
-    if len(df) < 20:
-        status_col = next((c for c in df.columns if str(c).lower() in ("incdnt_status_name", "статус события", "статус")), None)
-        group_counts = {"Группа 1: Утверждение": 0, "Группа 2: Черновик/Исследование": 0, "Группа 3: Удален": 0}
-        if status_col:
-            statuses = df[status_col].astype(str).str.strip()
-            for s in statuses:
-                s_lower = s.lower()
-                if s_lower in ("утверждение", "утверждён", "утвержден"):
-                    group_counts["Группа 1: Утверждение"] += 1
-                elif s_lower in ("черновик", "исследование"):
-                    group_counts["Группа 2: Черновик/Исследование"] += 1
-                elif s_lower in ("удалён", "удален"):
-                    group_counts["Группа 3: Удален"] += 1
+    if len(df) == 0:
+        return "### Общая информация о выгрузке:\nВыгрузка пуста. Нет данных для формирования гипотезы."
 
-        total_loss, direct_loss = get_total_and_direct_loss(df)
+    # 1. Determine running skill
+    skill_id = get_running_skill_id(df, session_id)
+    if skill_id is None:
+        skill_id = "ior_hypothesis_v2"
+        
+    running_skill = skill_id or ""
+    if running_skill.endswith("_v2"):
+        normalized_skill = running_skill[:-3]
+    else:
+        normalized_skill = running_skill
 
-        recovery_loss = 0.0
-        rec_cols_list = ["recovery", "Сумма возмещений", "возмещ", "recovery_rub_amt", "recovery_rub_amt_aggr", "Сумма возмещения (агрегат)", "Возмещение – итого по инциденту (руб.)"]
-        primary_rec = next((c for c in rec_cols_list if c in df.columns), None)
-        if not primary_rec:
-            money_cols = [c for c in df.columns if any(x in str(c).lower() for x in ("sum", "loss", "dmg", "rub", "amt", "потер", "убыт", "возмещ", "сумм"))]
-            rec_cols_fallback = [c for c in money_cols if any(x in str(c).lower() for x in ("rec", "возмещ", "возврат"))]
-            if rec_cols_fallback:
-                primary_rec = rec_cols_fallback[0]
-        if primary_rec:
-            recovery_loss = _to_numeric_clean(df[primary_rec]).sum()
+    # Protective check for TB filter leak (Task 15)
+    try:
+        tb_keywords = ["московск", "сибирск", "уральск", "байкальск", "дальневосточ", "поволжск", "северо-запад", "центральн", "юго-запад"]
+        requested_tb = None
+        for kw in tb_keywords:
+            if kw in user_msg.lower():
+                requested_tb = kw
+                break
+        if requested_tb:
+            tb_col = next((c for c in df.columns if any(x in str(c).lower() for x in ("тб", "орг. структура", "org_struct_lvl_3_name"))), None)
+            if tb_col:
+                unique_tbs = df[tb_col].dropna().unique()
+                if len(unique_tbs) > 1:
+                    logger.warning(
+                        f"[LEAK DETECTED] User requested TB containing '{requested_tb}', "
+                        f"but DataFrame has multiple unique TB values: {unique_tbs}"
+                    )
+    except Exception as leak_err:
+        logger.error(f"Error checking filter leak: {leak_err}")
 
-        net_loss = max(0.0, total_loss - recovery_loss)
-
-        report_lines = []
-        report_lines.append("### Общая информация о выгрузке:")
-        report_lines.append(f"Выгрузка успешно сформирована. Файл: **{file_info.get('name', 'отчет.xlsx')}** ({file_info.get('size', 'размер неизвестен')}).")
-        report_lines.append(f"- **Всего инцидентов в файле**: {len(df)}")
-        report_lines.append(f"- **Распределение по статусам**:")
-        report_lines.append(f"  • **Группа 1: Утверждение**: {group_counts['Группа 1: Утверждение']}")
-        report_lines.append(f"  • **Группа 2: Черновик/Исследование**: {group_counts['Группа 2: Черновик/Исследование']}")
-        report_lines.append(f"  • **Группа 3: Удален**: {group_counts['Группа 3: Удален']}")
-        report_lines.append("")
-        report_lines.append("### Финансовые показатели:")
-        report_lines.append(f"- **Общие потери**: {format_loss(total_loss)}")
-        report_lines.append(f"- **Прямые потери**: {format_loss(direct_loss)}")
-        report_lines.append(f"- **Сумма возмещений**: {format_loss(recovery_loss)}")
-        report_lines.append(f"- **Чистые потери (Net Loss)**: {format_loss(net_loss)}")
-        report_lines.append("")
-
-        id_col = next((c for c in df.columns if any(x in str(c).lower() for x in ("sid", "идентификатор", "key", "id"))), None)
-        loss_cols = ["incdnt_sum", "Общая сумма всех последствий (руб.)", "Общая сумма последствий (руб.)", "Сумма последствий, ₽"]
-        primary_loss_col = next((c for c in loss_cols if c in df.columns), None)
-        if not primary_loss_col:
-            loss_cols_fallback = [c for c in df.columns if any(x in str(c).lower() for x in ("sum", "loss", "dmg", "rub", "amt", "потер", "убыт", "сумм")) and not any(r in str(c).lower() for r in ("rec", "возмещ", "возврат"))]
-            if loss_cols_fallback:
-                primary_loss_col = loss_cols_fallback[0]
-
-        report_lines.append("### Инциденты, требующие внимания:")
-        if primary_loss_col and id_col and not df.empty:
-            df_sorted = df.copy()
-            df_sorted["numeric_loss"] = _to_numeric_clean(df_sorted[primary_loss_col])
-            df_sorted = df_sorted.sort_values(by="numeric_loss", ascending=False)
-
-            has_outliers = False
-            top_incidents = df_sorted.head(3)
-            for _, row in top_incidents.iterrows():
-                inc_id = row[id_col]
-                inc_loss = row["numeric_loss"]
-                if inc_loss > 0:
-                    has_outliers = True
-                    status_val = row[status_col] if (status_col and status_col in df.columns) else "Неизвестно"
-                    desc_col = next((c for c in df.columns if any(x in str(c).lower() for x in ("descr", "описание", "summary"))), None)
-                    desc_val = f": *{row[desc_col]}*" if desc_col and pd.notna(row[desc_col]) else ""
-                    if len(desc_val) > 100:
-                        desc_val = desc_val[:97] + "..."
-                    report_lines.append(f"- **Инцидент {inc_id}** (Статус: *{status_val}*): потери составляют **{format_loss(inc_loss)}**{desc_val}")
-
-            if not has_outliers:
-                report_lines.append("- В данной выгрузке нет инцидентов с ненулевыми финансовыми потерями.")
-        else:
-            report_lines.append("- Детальная информация по конкретным инцидентам не может быть извлечена (отсутствуют колонки идентификатора или сумм).")
-
-        report_lines.append("")
-        report_lines.append("*(Аналитические гипотезы не формировались, так как размер выборки составляет менее 20 инцидентов, что является статистически недостаточным для глубокого анализа трендов и закономерностей).*")
-
-        return "\n".join(report_lines)
-
-    # 5. Агрегация по статусам на старте
-    status_col = next((c for c in df.columns if str(c).lower() in ("incdnt_status_name", "статус события", "статус")), None)
+    # 2. Агрегация по статусам на старте
+    status_col = next((c for c in df.columns if any(x == str(c).lower().strip() for x in ("incdnt_status_name", "статус события", "статус", "статус инцидента", "status"))), None)
     group_counts = {"Группа 1: Утверждение": 0, "Группа 2: Черновик/Исследование": 0, "Группа 3: Удален": 0}
     if status_col:
         statuses = df[status_col].astype(str).str.strip()
@@ -997,122 +1383,282 @@ async def generate_hypothesis_narrative(user_msg: str, df: pd.DataFrame, file_in
                 group_counts["Группа 2: Черновик/Исследование"] += 1
             elif s_lower in ("удалён", "удален"):
                 group_counts["Группа 3: Удален"] += 1
-                
-    # 6. Фильтрация для анализа: только группа Утверждение
-    if status_col:
-        df_analysis = df[df[status_col].astype(str).str.strip().str.lower().isin(["утверждение", "утверждён", "утвержден"])].copy()
+
+    # 3. Фильтрация для анализа: группа Удален или Утверждение
+    is_deleted = (normalized_skill == "deleted_ior")
+    is_nonfinancial = (normalized_skill == "ior_nonfinancial_consequences")
+
+    if is_deleted:
+        if status_col:
+            df_analysis = df[df[status_col].astype(str).str.strip().str.lower().isin(["удалён", "удален"])].copy()
+        else:
+            df_analysis = df.copy()
     else:
+        if status_col:
+            df_analysis = df[df[status_col].astype(str).str.strip().str.lower().isin(["утверждение", "утверждён", "утвержден"])].copy()
+        else:
+            df_analysis = df.copy()
+
+    if df_analysis.empty and not df.empty:
         df_analysis = df.copy()
 
-    # 2. Расчет потерь
+    # 3.5. Расчет общих сумм по всей выгрузке (все статусы)
+    total_loss_all = 0.0
+    direct_loss_all = 0.0
+    recovery_loss_all = 0.0
+    
+    if not df.empty:
+        total_loss_all, direct_loss_all = get_total_and_direct_loss(df)
+        primary_rec_all = get_recovery_column(df, running_skill)
+        if primary_rec_all:
+            recovery_loss_all = _to_numeric_clean(df[primary_rec_all]).sum()
+            
+    net_loss_all = max(0.0, total_loss_all - recovery_loss_all)
+
+    # 4. Расчет потерь и возмещений для группы анализа (Утвержденные / Удаленные)
     total_loss, direct_loss = get_total_and_direct_loss(df_analysis)
 
-    # Расчет возмещений для группы Утвержден
     recovery_loss = 0.0
-    col_map = {str(c).lower().strip().replace("–", "-"): c for c in df_analysis.columns}
-    rec_cols_list = [
-        "recovery", 
-        "сумма возмещений", 
-        "возмещ", 
-        "recovery_rub_amt", 
-        "recovery_rub_amt_aggr", 
-        "сумма возмещения (агрегатор)", 
-        "возмещение - итого по инциденту (руб.)"
-    ]
-    primary_rec_analysis = None
-    for c_cand in rec_cols_list:
-        norm_cand = c_cand.lower().strip().replace("–", "-")
-        if norm_cand in col_map:
-            primary_rec_analysis = col_map[norm_cand]
-            break
-            
-    if not primary_rec_analysis:
-        money_cols = [c for c in df_analysis.columns if any(x in str(c).lower() for x in ("sum", "loss", "dmg", "rub", "amt", "потер", "убыт", "возмещ", "сумм"))]
-        rec_cols_fallback = [c for c in money_cols if any(x in str(c).lower() for x in ("rec", "возмещ", "возврат"))]
-        if rec_cols_fallback:
-            primary_rec_analysis = rec_cols_fallback[0]
-            
+    primary_rec_analysis = get_recovery_column(df_analysis, running_skill)
     if primary_rec_analysis:
         recovery_loss = _to_numeric_clean(df_analysis[primary_rec_analysis]).sum()
 
     net_loss = max(0.0, total_loss - recovery_loss)
 
-    # 3. Формирование префикса
-    prefix = (
-        f"### Распределение инцидентов по статусам:\n"
-        f"- **Группа 1: Утверждение**: {group_counts['Группа 1: Утверждение']}\n"
-        f"- **Группа 2: Черновик/Исследование**: {group_counts['Группа 2: Черновик/Исследование']}\n"
-        f"- **Группа 3: Удален**: {group_counts['Группа 3: Удален']}\n\n"
-        f"По инцидентам в статусе **Утвержден/Утверждение** (Группа 1):\n"
-        f"- **Общие потери**: {format_loss(total_loss)}\n"
-        f"- **Прямые потери**: {format_loss(direct_loss)}\n"
-        f"- **Сумма возмещений**: {format_loss(recovery_loss)}\n"
-        f"- **Чистые потери (Net Loss)**: {format_loss(net_loss)}\n\n"
-    )
+    # 5. Формирование префикса в зависимости от типа отчета
+    overall_stats = ""
+    if normalized_skill not in ("ior_nonfinancial_consequences", "credit_no_way_collect_debt", "report_period_specific_ior"):
+        overall_stats = (
+            f"### Общая информация по выгрузке:\n"
+            f"- **Всего инцидентов**: {len(df)}\n"
+            f"- **Общая сумма потерь**: {format_loss(total_loss_all)}\n"
+            f"- **Общая сумма возмещений**: {format_loss(recovery_loss_all)}\n"
+            f"- **Чистые потери (Net Loss)**: {format_loss(net_loss_all)}\n\n"
+        )
+    elif normalized_skill == "ior_nonfinancial_consequences":
+        overall_stats = (
+            f"### Общая информация по выгрузке:\n"
+            f"- **Всего качественных последствий**: {len(df)}\n\n"
+        )
 
-    # 8. Ограничение по удаленным: по ним собираются только базовые вещи
-    deleted_count = 0
-    deleted_loss = 0.0
-    deleted_rec = 0.0
+    if normalized_skill == "ior_nonfinancial_consequences":
+        qualitative_col = next((c for c in df.columns if str(c).lower().strip() in ("nonfin_impact_kind_name", "вид качественной потери")), None)
+        qualitative_summary = ""
+        if qualitative_col:
+            counts = df[qualitative_col].value_counts()
+            qualitative_summary = "#### Распределение по видам качественных потерь:\n"
+            for k, v in counts.items():
+                qualitative_summary += f"- **{k}**: {v}\n"
+            qualitative_summary += "\n"
+
+        prefix = (
+            f"### Распределение инцидентов по статусам:\n"
+            f"- **Группа 1: Утверждение**: {group_counts['Группа 1: Утверждение']}\n"
+            f"- **Группа 2: Черновик/Исследование**: {group_counts['Группа 2: Черновик/Исследование']}\n"
+            f"- **Группа 3: Удален**: {group_counts['Группа 3: Удален']}\n\n"
+            f"{qualitative_summary}"
+        )
+    elif normalized_skill == "deleted_ior":
+        prefix = (
+            f"### Распределение инцидентов по статусам:\n"
+            f"- **Группа 1: Утверждение**: {group_counts['Группа 1: Утверждение']}\n"
+            f"- **Группа 2: Черновик/Исследование**: {group_counts['Группа 2: Черновик/Исследование']}\n"
+            f"- **Группа 3: Удален**: {group_counts['Группа 3: Удален']}\n\n"
+            f"По инцидентам в статусе **Удален/Удалён** (Группа 3):\n"
+            f"- **Сумма потерь по удаленным инцидентам**: {format_loss(total_loss)}\n"
+            f"- **Сумма возмещений по удаленным инцидентам**: {format_loss(recovery_loss)}\n\n"
+        )
+    elif normalized_skill == "financial_consequences_ior":
+        type_summary = ""
+        type_col = next((c for c in df.columns if str(c).lower().strip() in ("fin_impact_type_name", "тип последствия")), None)
+        if type_col:
+            counts = df[type_col].value_counts()
+            type_summary = "#### Распределение по типам финансовых последствий:\n"
+            for k, v in counts.items():
+                type_summary += f"- **{k}**: {v}\n"
+            type_summary += "\n"
+        prefix = (
+            f"### Распределение инцидентов по статусам:\n"
+            f"- **Группа 1: Утверждение**: {group_counts['Группа 1: Утверждение']}\n"
+            f"- **Группа 2: Черновик/Исследование**: {group_counts['Группа 2: Черновик/Исследование']}\n"
+            f"- **Группа 3: Удален**: {group_counts['Группа 3: Удален']}\n\n"
+            f"{type_summary}"
+            f"По последствиям инцидентов:\n"
+            f"- **Суммарные потери по последствиям**: {format_loss(total_loss)}\n\n"
+        )
+    elif normalized_skill == "vozmeshenie_ior":
+        type_summary = ""
+        type_col = next((c for c in df.columns if str(c).lower().strip() in ("recovery_type_name", "тип возмещения")), None)
+        if type_col:
+            counts = df[type_col].value_counts()
+            type_summary = "#### Распределение по видам/источникам возмещений:\n"
+            for k, v in counts.items():
+                type_summary += f"- **{k}**: {v}\n"
+            type_summary += "\n"
+        prefix = (
+            f"### Распределение инцидентов по статусам:\n"
+            f"- **Группа 1: Утверждение**: {group_counts['Группа 1: Утверждение']}\n"
+            f"- **Группа 2: Черновик/Исследование**: {group_counts['Группа 2: Черновик/Исследование']}\n"
+            f"- **Группа 3: Удален**: {group_counts['Группа 3: Удален']}\n\n"
+            f"{type_summary}"
+            f"По возмещениям инцидентов:\n"
+            f"- **Сумма полученных возмещений**: {format_loss(recovery_loss)}\n\n"
+        )
+    elif normalized_skill == "credit_no_way_collect_debt":
+        total_debt = 0.0
+        total_rvps = 0.0
+        total_pledge = 0.0
+        debt_cols = [c for c in df.columns if any(x in str(c).lower() for x in ("debt", "credit", "loan", "договор", "задолженность", "сумма"))]
+        rvps_cols = [c for c in df.columns if any(x in str(c).lower() for x in ("rvps", "резерв", "рвпс"))]
+        pledge_cols = [c for c in df.columns if any(x in str(c).lower() for x in ("pledge", "залог", "обеспечение"))]
+        if debt_cols:
+            total_debt = _to_numeric_clean(df[debt_cols[0]]).sum()
+        if rvps_cols:
+            total_rvps = _to_numeric_clean(df[rvps_cols[0]]).sum()
+        if pledge_cols:
+            total_pledge = _to_numeric_clean(df[pledge_cols[0]]).sum()
+        prefix = (
+            f"### Сводная информация по проблемной задолженности:\n"
+            f"- **Количество кредитных договоров**: {len(df)}\n"
+            f"- **Общая сумма задолженности**: {format_loss(total_debt)}\n"
+            f"- **Сформированный резерв (РВПС)**: {format_loss(total_rvps)}\n"
+            f"- **Оценочная стоимость залогов**: {format_loss(total_pledge)}\n\n"
+        )
+    elif normalized_skill == "report_period_specific_ior":
+        if df.empty:
+            prefix = "### Детальное досье по инциденту:\n\nДанные по инциденту отсутствуют.\n\n"
+        else:
+            first_row = df.iloc[0]
+            sid_col_name = next((c for c in df.columns if str(c).lower().strip() in ("incdnt_sid", "идентификатор события")), "Идентификатор события")
+            status_col_name = next((c for c in df.columns if str(c).lower().strip() in ("incdnt_status_name", "статус события", "статус")), "Статус события")
+            
+            total_loss_col = next((c for c in df.columns if str(c).lower().strip() in ("incdnt_sum", "общая сумма всех последствий (руб.)", "общая сумма последствий (руб.)", "сумма последствий, ₽")), None)
+            direct_loss_col = next((c for c in df.columns if str(c).lower().strip() in ("incdnt_drct_dmg_sum", "прямая потеря – итого (руб.)", "прямая потеря - итого (руб.)")), None)
+            recovery_col_name = next((c for c in df.columns if str(c).lower().strip() in ("recovery_rub_amt_aggr", "возмещение – итого по инциденту (руб.)", "возмещение - итого по инциденту (руб.)")), None)
+            
+            spec_sid = first_row[sid_col_name] if sid_col_name in df.columns else "EVE-XXXXXXX"
+            spec_status = first_row[status_col_name] if status_col_name in df.columns else "Неизвестно"
+            
+            spec_total_loss = _to_numeric_clean(pd.Series([first_row[total_loss_col]])).iloc[0] if total_loss_col and total_loss_col in df.columns else 0.0
+            spec_direct_loss = _to_numeric_clean(pd.Series([first_row[direct_loss_col]])).iloc[0] if direct_loss_col and direct_loss_col in df.columns else 0.0
+            spec_recovery = _to_numeric_clean(pd.Series([first_row[recovery_col_name]])).iloc[0] if recovery_col_name and recovery_col_name in df.columns else 0.0
+            spec_net_loss = max(0.0, spec_total_loss - spec_recovery)
+            
+            prefix = (
+                f"### Детальное досье по инциденту {spec_sid}:\n"
+                f"- **Идентификатор события**: {spec_sid}\n"
+                f"- **Статус события**: {spec_status}\n"
+                f"- **Общие потери**: {format_loss(spec_total_loss)}\n"
+                f"- **Прямые потери**: {format_loss(spec_direct_loss)}\n"
+                f"- **Сумма возмещений**: {format_loss(spec_recovery)}\n"
+                f"- **Чистые потери (Net Loss)**: {format_loss(spec_net_loss)}\n\n"
+            )
+    else:
+        prefix = (
+            f"### Распределение инцидентов по статусам:\n"
+            f"- **Группа 1: Утверждение**: {group_counts['Группа 1: Утверждение']}\n"
+            f"- **Группа 2: Черновик/Исследование**: {group_counts['Группа 2: Черновик/Исследование']}\n"
+            f"- **Группа 3: Удален**: {group_counts['Группа 3: Удален']}\n\n"
+            f"По инцидентам в статусе **Утвержден/Утверждение** (Группа 1):\n"
+            f"- **Общие потери**: {format_loss(total_loss)}\n"
+            f"- **Прямые потери**: {format_loss(direct_loss)}\n"
+            f"- **Сумма возмещений**: {format_loss(recovery_loss)}\n"
+            f"- **Чистые потери (Net Loss)**: {format_loss(net_loss)}\n\n"
+        )
+
+    prefix = overall_stats + prefix
+
+    # 6. Сбор информации об удаленных (если мы не в summarization_only и не в deleted_ior)
+    is_summarization_only = (len(df_analysis) < 20) or (normalized_skill == "report_period_specific_ior")
     
-    if status_col:
-        df_deleted = df[df[status_col].astype(str).str.strip().str.lower().isin(["удалён", "удален"])].copy()
-        deleted_count = len(df_deleted)
+    deleted_text = ""
+    if not is_deleted and not is_summarization_only:
+        deleted_count = 0
+        deleted_loss = 0.0
+        deleted_rec = 0.0
         
-        # Calculate sum of losses for deleted
-        loss_cols = ["incdnt_sum", "Общая сумма всех последствий (руб.)", "Общая сумма последствий (руб.)"]
-        primary_loss = next((c for c in loss_cols if c in df.columns), None)
-        if not primary_loss:
-            money_cols = [c for c in df.columns if any(x in str(c).lower() for x in ("sum", "loss", "dmg", "rub", "amt", "потер", "убыт", "возмещ", "сумм"))]
-            loss_cols_fallback = [c for c in money_cols if any(x in str(c).lower() for x in ("loss", "dmg", "потер", "убыт", "sum", "сумм")) and not any(r in str(c).lower() for r in ("rec", "возмещ", "возврат"))]
-            if loss_cols_fallback:
-                primary_loss = loss_cols_fallback[0]
-                
-        rec_cols_list = ["recovery", "Сумма возмещений", "возмещ"]
-        primary_rec = next((c for c in rec_cols_list if c in df.columns), None)
-        if not primary_rec:
-            money_cols = [c for c in df.columns if any(x in str(c).lower() for x in ("sum", "loss", "dmg", "rub", "amt", "потер", "убыт", "возмещ", "сумм"))]
-            rec_cols_fallback = [c for c in money_cols if any(x in str(c).lower() for x in ("rec", "возмещ", "возврат"))]
-            if rec_cols_fallback:
-                primary_rec = rec_cols_fallback[0]
-                
-        if primary_loss and not df_deleted.empty:
-            deleted_loss = _to_numeric_clean(df_deleted[primary_loss]).sum()
-        if primary_rec and not df_deleted.empty:
-            deleted_rec = _to_numeric_clean(df_deleted[primary_rec]).sum()
+        if status_col:
+            df_deleted = df[df[status_col].astype(str).str.strip().str.lower().isin(["удалён", "удален"])].copy()
+            deleted_count = len(df_deleted)
+            
+            loss_cols = ["incdnt_sum", "Общая сумма всех последствий (руб.)", "Общая сумма последствий (руб.)", "Сумма последствий, ₽"]
+            primary_loss = next((c for c in loss_cols if c in df.columns), None)
+            if not primary_loss:
+                money_cols = [c for c in df.columns if any(x in str(c).lower() for x in ("sum", "loss", "dmg", "rub", "amt", "потер", "убыт", "возмещ", "сумм"))]
+                loss_cols_fallback = [c for c in money_cols if any(x in str(c).lower() for x in ("loss", "dmg", "потер", "убыт", "sum", "сумм")) and not any(r in str(c).lower() for r in ("rec", "возмещ", "возврат"))]
+                if loss_cols_fallback:
+                    primary_loss = loss_cols_fallback[0]
+                    
+            rec_cols_list = [
+                "recovery", 
+                "сумма возмещений", 
+                "сумма возмещения", 
+                "сумма возмещения (руб.)", 
+                "сумма возмещений (руб.)", 
+                "возмещ", 
+                "recovery_rub_amt", 
+                "recovery_rub_amt_aggr", 
+                "сумма возмещения (агрегатор)", 
+                "возмещение - итого по инциденту (руб.)"
+            ]
+            primary_rec = next((c for c in rec_cols_list if c in df.columns), None)
+            if not primary_rec:
+                money_cols = [c for c in df.columns if any(x in str(c).lower() for x in ("sum", "loss", "dmg", "rub", "amt", "потер", "убыт", "возмещ", "сумм"))]
+                rec_cols_fallback = [c for c in money_cols if any(x in str(c).lower() for x in ("rec", "возмещ", "возврат"))]
+                if rec_cols_fallback:
+                    primary_rec = rec_cols_fallback[0]
+                    
+            if primary_loss and not df_deleted.empty:
+                deleted_loss = _to_numeric_clean(df_deleted[primary_loss]).sum()
+            if primary_rec and not df_deleted.empty:
+                deleted_rec = _to_numeric_clean(df_deleted[primary_rec]).sum()
 
-    deleted_text = (
-        f"\n### Информация об удаленных инцидентах:\n"
-        f"- **Количество удаленных инцидентов**: {deleted_count}\n"
-        f"- **Сумма потерь по удаленным инцидентам**: {format_loss(deleted_loss)}\n"
-        f"- **Сумма возмещений по удаленным инцидентам**: {format_loss(deleted_rec)}\n\n"
-        f"Если вы хотите больше узнать о причинах удаления инцидентов, создайте новую сессию и запросите выгрузку по удаленным инцидентам.\n\n"
-    )
+        deleted_text = (
+            f"\n### Информация об удаленных инцидентах:\n"
+            f"- **Количество удаленных инцидентов**: {deleted_count}\n"
+            f"- **Сумма потерь по удаленным инцидентам**: {format_loss(deleted_loss)}\n"
+            f"- **Сумма возмещений по удаленным инцидентам**: {format_loss(deleted_rec)}\n\n"
+            f"Если вы хотите больше узнать о причинах удаления инцидентов, создайте новую сессию и запросите выгрузку по удаленным инцидентам.\n\n"
+        )
 
-    # 9. Ретроспективный анализ профилей риска (отключен по требованию пользователя)
     retro_text = ""
+    profile = profile_dataframe(df_analysis, running_skill=normalized_skill)
 
-    profile = profile_dataframe(df_analysis)
-    
-    # Check if the query asks for a hypothesis / dynamics / trends
-    low_msg = user_msg.lower()
-    is_hypothesis_query = any(x in low_msg for x in ("гипотез", "аномал", "динамик", "анализ", "тренд"))
-    is_dynamics_query = any(x in low_msg for x in ("динамик", "график", "тренд", "изменен", "рост", "спад"))
-
+    # 7. Check if chart is needed
     chart_file_id = None
-    if is_dynamics_query or len(df_analysis) > 30:
-        # Generate charts asynchronously in worker threads to prevent blocking the event loop
-        chart_file_id = await asyncio.to_thread(generate_dynamics_chart, df_analysis, session_id)
+    if normalized_skill not in ("ior_nonfinancial_consequences", "deleted_ior"):
+        low_msg = user_msg.lower()
+        is_dynamics_query = any(x in low_msg for x in ("динамик", "график", "тренд", "изменен", "рост", "спад"))
+        if is_dynamics_query or len(df_analysis) > 30:
+            chart_file_id = await asyncio.to_thread(generate_dynamics_chart, df_analysis, session_id)
 
-    llm = get_llm()
+    # 8. Extract summaries of descriptions / comments (always analyze through Qwen)
+    if normalized_skill == "deleted_ior":
+        comment_col = next((c for c in df_analysis.columns if str(c).lower().strip() in ("stts_chng_comment_txt", "комментарий / причина действия", "комментарий / причина", "комментарий", "причина действия", "причина удаления")), None)
+        comments_summary = ""
+        if comment_col:
+            comments_series = df_analysis[comment_col].dropna().astype(str).str.strip()
+            unique_comments = [c for c in comments_series.unique() if c and c.lower() not in ("nan", "none", "—", "-")]
+            comments_summary = await summarize_deletion_comments(unique_comments)
+            
+        # Combine comments summary and incident descriptions to enrich the deleted hypothesis
+        inc_desc_summary = await analyze_incident_descriptions(df_analysis)
+        if comments_summary:
+            desc_summary = f"{comments_summary}\n\n#### Детальный анализ содержания удаленных инцидентов:\n{inc_desc_summary}"
+        else:
+            desc_summary = inc_desc_summary
+    else:
+        desc_summary = await analyze_incident_descriptions(df_analysis)
+
+    # 9. Prompts selection
+    prompts = {}
     
-    # Deep, expert-auditor grade prompt formulation (Requirement 12: simpler and clearer narrative style)
-    system_prompt = """Ты — эксперт-аналитик Службы внутреннего аудита.
+    prompts["ior_hypothesis"] = """Ты — эксперт-аналитик Службы внутреннего аудита.
 Твоя задача — провести анализ представленного профиля данных инцидентов операционного риска и сформулировать аналитические гипотезы о возможных причинах этих инцидентов.
 
 Пиши максимально простым, понятным и человеческим языком без эмоций, преувеличений и сложного IT или узкоспециализированного корпоративного жаргона. Текст должен быть легким для чтения и понятным любому линейному аналитику или сотруднику.
-- Полностью избегай оценочных и экспрессивных выражений (например, "экстремальная концентрация", "катастрофический сбой", "немедленный аудит", "это означает, что").
-- Избегай перегруженных сложных терминов. Вместо тяжелого IT-жаргона используй простые аналоги (например, вместо "недостаточная отказоустойчивость" пиши "частые сбои в работе систем", вместо "каскадные последствия" — "цепная реакция сбоев" или "последующие ошибки", вместо "синергетический эффект" — "взаимное влияние проблем"). Обычные технические термины вроде "мониторинг систем" или "автоматизация контроля" использовать можно.
+- Полностью избегай оценочных и экспрессивных выражений (например, "экстремальная концентрация", "катастрофический сбой", "немедленный аудит").
+- Избегай перегруженных сложных терминов. Вместо тяжелого IT-жаргона используй простые аналоги. Обычные технические термины использовать можно.
 - Излагай факты и предположения сухо, четко, структурированно, с использованием списков и ключевых метрик.
 
 Придерживайся следующей структуры отчета:
@@ -1120,7 +1666,7 @@ async def generate_hypothesis_narrative(user_msg: str, df: pd.DataFrame, file_in
 ### 1. Общая сводка данных
 - Кратко перечисли ключевые показатели: общее число инцидентов, общая сумма всех последствий, сумма возмещений и чистые потери по группе Утверждение.
 - Укажи, какая самая частая причина инцидентов (основная причина / тип события).
-- Опиши общую динамику регистрации во времени (в какие периоды/месяцы зафиксировано больше всего инцидентов, когда наблюдался спад).
+- Опиши общую динамику регистрации во времени.
 - Важно: пиши этот раздел как чистое, сухое описание фактов БЕЗ каких-либо выводов, анализа, интерпретаций или гипотез.
 
 ### 2. Выявленные аномалии и динамика трендов
@@ -1132,25 +1678,262 @@ async def generate_hypothesis_narrative(user_msg: str, df: pd.DataFrame, file_in
 - Укажи конкретные идентификаторы событий (например, EVE-XXXXXXX) из топа крупнейших инцидентов и проанализируй их вклад.
 - Поле "Тип события - уровень 1" (incdnt_type_lvl_1_name) транслируй в отчет как "Основная причина".
 - Оцени долю авторегистрации (процент авторегистрированных инцидентов).
-- Важно: НЕ перегружай отчет бесконечным перечислением процентов концентрации и долей (например, вклад Топ-10/Топ-5 в процентах, доля авторегистрации). Упомяни эти доли кратко один раз, но не строй весь отчет и гипотезы вокруг них.
+- Важно: НЕ перегружай отчет бесконечным перечислением процентов концентрации и долей.
 
 ### 4. Аналитические гипотезы для аудиторской проверки
-- Сформулируй 2-3 гипотезы (теории) по РАЗЛИЧНЫМ направлениям на основе предоставленных данных (например, одна гипотеза о конкретном техническом сбое или уязвимости в системах на основе топ-30 инцидентов, другая — об операционных процессах или ошибках ввода, третья — о специфике контроля).
-- Важно: гипотезы должны быть разнообразными. Не зацикливайся на одной и той же теме (например, только ручном вводе или процентах концентрации) во всех гипотезах.
-- Каждая гипотеза должна сопровождаться конкретными шагами проверки и ожидаемым результатом.
+Сформулируй ровно 3 аналитические гипотезы, закрепив за каждой обязательный ракурс:
+- Гипотеза 1: Обязательно строится на концентрации потерь (крупнейшие инциденты, конкретные EVE-id и точные суммы потерь).
+- Гипотеза 2: Обязательно строится на географии/оргструктуре (распределение по ТБ/блокам).
+- Гипотеза 3: Обязательно строится на содержании описаний инцидентов (реальные факты из анализа описаний инцидентов desc_summary), а не на агрегированных долях/процентах.
+Гипотезы не могут опираться на одну и ту же метрику или вести к одному и тому же выводу о причинах — если два вывода совпадают по сути, один из них нужно заменить. Каждая гипотеза должна сопровождаться конкретными шагами проверки (не более 3 шагов на гипотезу, без указания вымышленных числовых порогов) и ожидаемым результатом (описанным качественно, без придуманных чисел)."""
 
-Оперируй исключительно реальными цифрами, процентами и названиями из предоставленного профиля данных. Если какие-то метрики (например, возмещения) отсутствуют или равны нулю, не упоминай их.
-ОБЯЗАТЕЛЬНО в самом начале или при первом упоминании финансовых показателей укажи точные цифры общей суммы всех последствий (incdnt_sum), суммы возмещений (recovery) и чистые потери (Net Loss) по группе Утверждение.
-Если все финансовые показатели равны нулю или отсутствуют, сфокусируйся на анализе количества инцидентов, динамике регистраций, оргструктуре/ТБ и авторегистрации.
-Пиши строго на русском языке. Все заголовки разделов пиши ровно так, как они указаны выше.
+    prompts["deleted_ior"] = """Ты — эксперт-аналитик Службы внутреннего аудита.
+Твоя задача — провести анализ удаленных инцидентов операционного риска на основе предоставленных данных и результатов суммаризации комментариев сотрудников о причинах удаления.
+
+Пиши максимально простым, понятным и человеческим языком без эмоций, преувеличений и сложного IT или узкоспециализированного корпоративного жаргона. Текст должен быть легким для чтения и понятным любому линейному аналитику или сотруднику.
+- Полностью избегай оценочных и экспрессивных выражений (например, "катастрофический сбой", "немедленный аудит").
+- Избегай перегруженных сложных терминов. Вместо тяжелого IT-жаргона используй простые аналоги.
+- Излагай факты и предположения сухо, четко, структурированно, с использованием списков и ключевых метрик.
+- Важно: НЕ упоминай точное количество проанализированных комментариев или строк (например, 'проанализировано 300 комментариев'). Вместо этого пиши о популярных причинах качественно (например, "наиболее распространенной причиной является...", "часто встречаются случаи...").
+
+Придерживайся следующей структуры отчета:
+
+### 1. Общая сводка данных
+- Кратко перечисли ключевые показатели: общее число удаленных инцидентов, общая сумма последствий по удаленным инцидентам, сумма возмещений по удаленным инцидентам.
+- Укажи основные действия пользователей (например, удалено вручную, отменено).
+- Опиши временную динамику удаления инцидентов.
+- Важно: пиши этот раздел как чистое, сухое описание фактов БЕЗ каких-либо выводов, анализа, интерпретаций или гипотез.
+
+### 2. Выявленные аномалии и динамика трендов
+- Опиши динамику удалений во времени (сезонность, всплески). Сформулируй предположение о возможных причинах всплеска.
+- Выдели распределение по территориальным банкам (ТБ) или процессам, перечислив лидеров по количеству удалений.
+
+### 3. Концентрация рисков и системные факторы
+- Опиши концентрацию удалений: укажи вклад Топ-10 крупнейших удаленных инцидентов.
+- Выдели наиболее популярные причины удаления на основе предоставленного анализа комментариев сотрудников (например, дубликаты, технические сбои АС при авторегистрации, ошибки ручного ввода реквизитов).
+
+### 4. Аналитические гипотезы для аудиторской проверки
+Сформулируй ровно 3 аналитические гипотезы о причинах удаления инцидентов, закрепив обязательные ракурсы:
+- Гипотеза 1: Обязательно строится на анализе комментариев сотрудников о причинах удаления (дубликаты, ошибки ручного ввода и т.д.).
+- Гипотеза 2: Обязательно строится на географии/оргструктуре удалений (ТБ, лидеры по количеству удалений).
+- Гипотеза 3: Обязательно строится на концентрации потерь по удаленным инцидентам (крупнейшие удаленные инциденты, конкретные EVE-id и суммы потерь).
+Гипотезы не могут опираться на одну и ту же метрику или вести к одному и тому же выводу о причинах — если два вывода совпадают по сути, один из них нужно заменить. Каждая гипотеза должна сопровождаться конкретными шагами проверки (не более 3 шагов на гипотезу, без указания вымышленных числовых порогов) и ожидаемым результатом (описанным качественно, без придуманных чисел)."""
+
+    prompts["ior_nonfinancial_consequences"] = """Ты — эксперт-аналитик Службы внутреннего аудита.
+Твоя задача — провести анализ качественных (нефинансовых) последствий инцидентов операционного риска и сформулировать аналитические гипотезы.
+
+Придерживайся следующей структуры отчета:
+
+### 1. Общая сводка данных
+- Кратко перечисли ключевые показатели: общее число инцидентов с качественными последствиями.
+- Укажи распределение по видам качественных потерь (например, репутационный риск, прерывание деятельности, регуляторные санкции).
+- Опиши общую динамику регистрации во времени.
+- Важно: пиши этот раздел как чистое, сухое описание фактов БЕЗ каких-либо выводов, анализа, интерпретаций или гипотез.
+
+### 2. Выявленные аномалии и динамика трендов
+- Опиши динамику во времени (сезонность, тренды спада/роста, временные всплески). Сформулируй предположение о возможных причинах временного всплеска.
+- Выдели распределение по территориальным банкам (ТБ) или процессам, перечислив лидеров по количеству инцидентов.
+
+### 3. Концентрация рисков и системные факторы
+- Опиши концентрацию рисков: укажи наиболее подверженные качественным рискам процессы и подразделения.
+- Оцени долю авторегистрации (процент авторегистрированных инцидентов).
+
+### 4. Аналитические гипотезы для аудиторской проверки
+Сформулируй ровно 3 аналитические гипотезы по качественным рискам, закрепив обязательные ракурсы:
+- Гипотеза 1: Обязательно строится на структуре качественных последствий (виды качественных потерь, например, репутационный риск или прерывание деятельности).
+- Гипотеза 2: Обязательно строится на географии/оргструктуре (распределение качественных инцидентов по ТБ/процессам).
+- Гипотеза 3: Обязательно строится на содержании описаний инцидентов (реальные факты из анализа описаний инцидентов desc_summary), связывая их с рисками информационных систем или поведением персонала.
+Гипотезы не могут опираться на одну и ту же метрику или вести к одному и тому же выводу о причинах — если два вывода совпадают по сути, один из них нужно заменить. Каждая гипотеза должна сопровождаться конкретными шагами проверки (не более 3 шагов на гипотезу, без указания вымышленных числовых порогов) и ожидаемым результатом (описанным качественно, без придуманных чисел)."""
+
+    prompts["financial_consequences_ior"] = """Ты — эксперт-аналитик Службы внутреннего аудита.
+Твоя задача — провести анализ финансовых последствий инцидентов операционного риска на основе предоставленных детальных данных о последствиях и сформулировать аналитические гипотезы.
+
+- Излагай факты и предположения сухо, четко, структурированно, с использованием списков и ключевых метрик.
+- Важно: В данной выгрузке (детализация финансовых последствий) СТРУКТУРНО отсутствуют данные по возмещениям (возвратам денег). Ни при каких условиях не упоминай суммы или проценты возмещений (recovery) в тексте отчёта — если тебе кажется, что ты видишь такие данные в переданном профиле данных, это ошибка, полностью игнорируй их.
+
+Придерживайся следующей структуры отчета:
+
+### 1. Общая сводка финансовых последствий
+- Кратко перечисли ключевые показатели: общее число записей о последствиях, общая сумма зафиксированных потерь.
+- Укажи структуру и распределение по типам финансовых последствий (например, прямые, косвенные, нереализовавшиеся потери, потери третьих лиц, прибыль).
+- Опиши временную динамику возникновения финансовых последствий.
+- Важно: пиши этот раздел как чистое, сухое описание фактов БЕЗ каких-либо выводов, анализа, интерпретаций или гипотез.
+
+### 2. Структура и виды потерь
+- Выдели ключевые виды потерь на основе поля вида последствий (например, хищение, судебные расходы, списание).
+- Перечисли территориальные банки (ТБ) или подразделения, лидирующие по объему финансовых потерь.
+
+### 3. Концентрация финансовых последствий и крупные потери
+- Опиши концентрацию: вклад топ-10 крупнейших последствий в общий объем потерь.
+- Укажи конкретные инциденты (EVE-XXXXXXX) с наибольшими суммами последствий.
+
+### 4. Аналитические гипотезы для аудиторской проверки
+Сформулируй ровно 3 аналитические гипотезы о причинах возникновения финансовых последствий, закрепив обязательные ракурсы:
+- Гипотеза 1: Обязательно строится на структуре и видах потерь (списание, судебные расходы, хищения).
+- Гипотеза 2: Обязательно строится на концентрации финансовых последствий (крупные потери, конкретные инциденты EVE-id с наибольшими суммами).
+- Гипотеза 3: Обязательно строится на географии/оргструктуре финансовых потерь (распределение по ТБ/подразделениям).
+Гипотезы не могут опираться на одну и ту же метрику или вести к одному и тому же выводу о причинах — если два вывода совпадают по сути, один из них нужно заменить. Каждая гипотеза должна сопровождаться конкретными шагами проверки (не более 3 шагов на гипотезу, без указания вымышленных числовых порогов) и ожидаемым результатом (описанным качественно, без придуманных чисел)."""
+
+    prompts["vozmeshenie_ior"] = """Ты — эксперт-аналитик Службы внутреннего аудита.
+Твоя задача — провести анализ полученных возмещений (возвратов, страховых выплат, компенсаций) по инцидентам операционного риска и сформулировать аналитические гипотезы.
+
+Пиши максимально простым, понятным и человеческим языком без эмоций, преувеличений и сложного IT или узкоспециализированного корпоративного жаргона. Текст должен быть легким для чтения и понятным любому линейному аналитику или сотруднику.
+- Полностью избегай оценочных и экспрессивных выражений.
+- Излагай факты и предположения сухо, четко, структурированно, с использованием списков и ключевых метрик.
+
+Придерживайся следующей структуры отчета:
+
+### 1. Общая сводка по возмещениям
+- Кратко перечисли ключевые показатели: общее число записей о возмещениях, общая сумма полученных возмещений.
+- Укажи распределение по типам/источникам возмещений (например, страховые выплаты, внесудебные возвраты от клиентов, взыскания с сотрудников).
+- Опиши временную динамику поступления возмещений.
+- Важно: пиши этот раздел как чистое, сухое описание фактов БЕЗ каких-либо выводов, анализа, интерпретаций или гипотез.
+
+### 2. Географическая и процессная структура возмещений
+- Перечисли территориальные банки (ТБ) или функциональные блоки, лидирующие по суммам возвращенных средств.
+- Опиши, по каким типам инцидентов возмещения проходят наиболее успешно.
+
+### 3. Концентрация и крупные возмещения
+- Опиши концентрацию: вклад топ-10 крупнейших возмещений в общую сумму возврата.
+- Выдели инциденты (EVE-XXXXXXX) с наибольшей долей возмещенных потерь.
+
+### 4. Аналитические гипотезы для аудиторской проверки
+Сформулируй ровно 3 аналитические гипотезы об эффективности процессов возмещения, закрепив обязательные ракурсы:
+- Гипотеза 1: Обязательно строится на источниках возмещений (страховые выплаты, взыскания с сотрудников, возвраты от клиентов).
+- Гипотеза 2: Обязательно строится на географии/оргструктуре возмещений (ТБ/блоки, лидирующие по суммам возвратов).
+- Гипотеза 3: Обязательно строится на концентрации возмещений (крупнейшие возмещения по инцидентам EVE-id с высокой долей возмещенных потерь).
+Гипотезы не могут опираться на одну и ту же метрику или вести к одному и тому же выводу о причинах — если два вывода совпадают по сути, один из них нужно заменить. Каждая гипотеза должна сопровождаться конкретными шагами проверки (не более 3 шагов на гипотезу, без указания вымышленных числовых порогов) и ожидаемым результатом (описанным качественно, без придуманных чисел)."""
+
+    prompts["credit_no_way_collect_debt"] = """Ты — эксперт-аналитик Службы внутреннего аудита.
+Твоя задача — провести анализ случаев невозможности взыскания задолженности по кредитным продуктам и сформулировать аналитические гипотезы.
+
+Пиши максимально простым, понятным и человеческим языком без эмоций, преувеличений и сложного IT или узкоспециализированного корпоративного жаргона. Текст должен быть легким для чтения и понятным любому линейному аналитику или сотруднику.
+- Полностью избегай оценочных и экспрессивных выражений.
+- Излагай факты и предположения сухо, четко, структурированно, с использованием списков и ключевых метрик.
+
+Придерживайся следующей структуры отчета:
+
+### 1. Сводные показатели по кредитной задолженности
+- Кратко перечисли ключевые показатели: общее количество проанализированных кредитных договоров, общая сумма задолженности, размер сформированного резерва (РВПС).
+- Укажи распределение по типам заемщиков (физические лица, юридические лица) и продуктам.
+- Важно: пиши этот раздел как чистое, сухое описание фактов БЕЗ каких-либо выводов, анализа, интерпретаций или гипотез.
+
+### 2. Причины невозможности взыскания и залоговое обеспечение
+- Проанализируй основные причины невозможности взыскания (ликвидация заемщика, истечение срока исковой давности, невключение в реестр требований кредиторов).
+- Опиши структуру и достаточность залогового обеспечения по проблемным договорам.
+
+### 3. Крупнейшие кейсы задолженности
+- Опиши крупнейшие случаи невозврата кредитов, указав их долю в общем объеме нереализованного взыскания.
+
+### 4. Аналитические гипотезы для аудиторской проверки
+Сформулируй ровно 2-3 аналитические гипотезы о системных недостатках в кредитном процессе, закрепив обязательные ракурсы:
+- Гипотеза 1: Обязательно строится на причинах невозможности взыскания (ликвидация заемщика, истечение срока исковой давности, невключение в реестр требований) и роли залогового обеспечения.
+- Гипотеза 2: Обязательно строится на концентрации проблемной задолженности (крупнейшие кейсы невозврата и их доля в общем объеме).
+- Гипотеза 3: Обязательно строится на распределении по типам заемщиков и кредитным продуктам.
+Гипотезы не могут опираться на одну и ту же метрику или вести к одному и тому же выводу о причинах — если два вывода совпадают по сути, один из них нужно заменить. Каждая гипотеза должна сопровождаться конкретными шагами проверки (не более 3 шагов на гипотезу, без указания вымышленных числовых порогов) и ожидаемым результатом (описанным качественно, без придуманных чисел)."""
+
+    prompts["report_period_specific_ior"] = """Ты — эксперт-аналитик Службы внутреннего аудита.
+Твоя задача — провести детальный анализ конкретного инцидента (или группы конкретных инцидентов) операционного риска (досье ИОР) и сформулировать аналитические гипотезы о его причинах.
+
+Пиши максимально простым, понятным и человеческим языком без эмоций, преувеличений и сложного IT или узкоспециализированного корпоративного жаргона. Текст должен быть легким для чтения и понятным любому линейному аналитику или сотруднику.
+- Полностью избегай оценочных и экспрессивных выражений.
+- Излагай факты и предположения сухо, четко, структурированно, с использованием списков и ключевых метрик.
+
+Придерживайся следующей структуры отчета:
+
+### 1. Сведения об инциденте
+- Кратко перечисли ключевые реквизиты инцидента: бизнес-идентификатор (incdnt_sid), статус, даты регистрации и совершения события.
+- Опиши финансовые параметры: общая сумма последствий, прямые/косвенные потери, сумма возмещения.
+- Укажи организационное подразделение (ТБ) и процесс, в котором зафиксировано событие.
+- Важно: пиши этот раздел как чистое, сухое описание фактов БЕЗ каких-либо выводов, анализа, интерпретаций или гипотез.
+
+### 2. Описание события и каналы обнаружения
+- Приведи резюме сути инцидента на основе описания.
+- Укажи источник и канал выявления события.
+
+### 3. Выявленные особенности инцидента
+- Проанализируй специфические факторы события (например, участие информационных систем, признаки авторегистрации, человеческий фактор).
+
+### 4. Аналитические гипотезы для аудиторской проверки
+Сформулируй ровно 2 аналитические гипотезы о причинах возникновения данного конкретного инцидента, закрепив обязательные ракурсы:
+- Гипотеза 1: Обязательно строится на содержании описания этого конкретного события (фактические действия персонала, участие информационных систем, сбои АС).
+- Гипотеза 2: Обязательно строится на организационном контексте (роль подразделения, ТБ, процесса, канала выявления).
+Гипотезы не могут опираться на одну и ту же метрику или вести к одному и тому же выводу о причинах — если два вывода совпадают по сути, один из них нужно заменить. Каждая гипотеза должна сопровождаться конкретными шагами проверки (не более 3 шагов на гипотезу, без указания вымышленных числовых порогов) и ожидаемым результатом (описанным качественно, без придуманных чисел)."""
+
+    prompts["ior_period_pao_sberbank"] = """Ты — эксперт-аналитик Службы внутреннего аудита.
+Твоя задача — провести комплексный анализ инцидентов операционного риска по ПАО Сбербанк за указанный период и сформулировать аналитические гипотезы.
+
+Пиши максимально простым, понятным и человеческим языком без эмоций, преувеличений и сложного IT или узкоспециализированного корпоративного жаргона. Текст должен быть легким для чтения и понятным любому линейному аналитику или сотруднику.
+- Полностью избегай оценочных и экспрессивных выражений.
+- Излагай факты и предположения сухо, четко, структурированно, с использованием списков и ключевых метрик.
+
+Придерживайся следующей структуры отчета:
+
+### 1. Общая сводка данных
+- Кратко перечисли ключевые показатели: общее число зарегистрированных инцидентов, общая сумма всех последствий, сумма возмещений и чистые потери (Net Loss) по ПАО Сбербанк.
+- Укажи распределение инцидентов по статусам.
+- Важно: пиши этот раздел как чистое, сухое описание фактов БЕЗ каких-либо выводов, анализа, интерпретаций или гипотез.
+
+### 2. Выявленные аномалии и динамика трендов
+- Опиши динамику во времени (сезонность, тренды спада/роста, временные всплески). Сформулируй предположение о возможных причинах всплесков.
+- Выдели распределение по территориальным банкам (ТБ) или процессам, перечислив лидеров по сумме потерь и количеству инцидентов.
+
+### 3. Концентрация рисков и системные факторы
+- Опиши концентрацию рисков: вклад топ-10 крупнейших инцидентов в общую сумму потерь, укажите их идентификаторы (EVE-XXXXXXX).
+- Оцени долю авторегистрации инцидентов.
+
+### 4. Аналитические гипотезы для аудиторской проверки
+Сформулируй ровно 3 аналитические гипотезы, закрепив за каждой обязательный ракурс:
+- Гипотеза 1: Обязательно строится на концентрации потерь (Топ-10 крупнейших инцидентов по ПАО Сбербанк с конкретными EVE-id).
+- Гипотеза 2: Обязательно строится на географии/оргструктуре (распределение инцидентов по ТБ и процессам в рамках ПАО Сбербанк).
+- Гипотеза 3: Обязательно строится на содержании описаний инцидентов (факты из анализа описаний инцидентов desc_summary), а не на общих долях.
+Гипотезы не могут опираться на одну и ту же метрику или вести к одному и тому же выводу о причинах — если два вывода совпадают по сути, один из них нужно заменить. Каждая гипотеза должна сопровождаться конкретными шагами проверки (не более 3 шагов на гипотезу, без указания вымышленных числовых порогов) и ожидаемым результатом (описанным качественно, без придуманных чисел)."""
+
+    critical_rules = """КРИТИЧЕСКИЕ ПРАВИЛА И ОГРАНИЧЕНИЯ (ПРОЧТИ В ПЕРВУЮ ОЧЕРЕДЬ):
+1. ВАЖНО: Авторегистрация (авторег) — это нормальный штатный процесс регистрации событий, а не негативный фактор, проблема или уязвимость. СТРОГО ЗАПРЕЩЕНО критиковать авторегистрацию или интерпретировать долю авторегистрации как негативный фактор, проблему или недостаток.
+2. ВАЖНО: Аналитические гипотезы не должны дублировать друг друга по смыслу и не должны сводиться к одному и тому же выводу. Каждая гипотеза обязана иметь свой собственный уникальный ракурс и вести к принципиально разным выводам о причинах произошедшего.
+
 """
 
-    if not is_hypothesis_query:
-        system_prompt += "\nСформулируй краткую гипотезу или наблюдение на основе данных выгрузки в конце отчета. Начни с общей информации о выгрузке (файл готов, количество строк). ОБЯЗАТЕЛЬНО в самом начале укажи общую сумму всех последствий (incdnt_sum), сумму возмещений (recovery) и чистые потери (Net Loss) по группе Утверждение."
+    system_prompt = critical_rules + prompts.get(normalized_skill, prompts["ior_hypothesis"])
     
-    # Batch extraction and Qwen analysis of incident descriptions (Requirement 10)
-    desc_summary = await analyze_incident_descriptions(df_analysis)
-    
+    # Append global rules for style, jargon-prevention, distinct hypotheses and specific figures/IDs (EVE-XXXXXXX)
+    global_rules = """
+
+КРИТИЧЕСКИЕ ПРАВИЛА ЯЗЫКА И ФОРМАТИРОВАНИЯ:
+1. Пиши понятным, человеческим языком для аудитора. Избегай сложных IT-терминов, тяжеловесного жаргона и преувеличений.
+2. СТРОГО ЗАПРЕЩЕНО использовать следующие слова и словосочетания:
+   - "каскадные потери"
+   - "каскадные последствия"
+   - "каскадный сбой"
+   - "экстремальная концентрация"
+   - "синергетический эффект"
+   - "недостаточная отказоустойчивость"
+   - "технологический стек"
+3. Вместо заумных фраз пиши проще: например, вместо "недостаточная отказоустойчивость" пиши "частые технические сбои", вместо "каскадные последствия" — "цепная реакция сбоев" или "последующие ошибки".
+4. СТРОГО ЗАПРЕЩЕНО создавать разделы, которые не предусмотрены структурой шаблона выше. В отчёте должны быть только разрешенные разделы (обычно 1-4). Запрещено добавлять разделы до, между или после них (включая "Следующие шаги", "Финальный вывод", "Выводы", "Рекомендации", "Дополнительно", "Заключение", "Итоги", "Резюме", "Вывод"). Если требуется дать рекомендации по проверке гипотезы, они должны располагаться исключительно внутри описания шагов проверки в разделе 4.
+5. Больше конкретики в деталях: не пиши общие фразы вроде "топ-10 составляет большую часть потерь". Указывай конкретные цифры и суммы (например, "на топ-10 инцидентов приходится 45.2 млн руб. потерь").
+6. Обязательно ссылайся на конкретные идентификаторы событий (например, EVE-XXXXXXX) и пиши их точные суммы потерь при описании крупных инцидентов.
+7. Не делай огромных пустых строк между абзацами.
+8. Все цифры и проценты в разных частях одного отчёта должны быть взаимно непротиворечивы — если в сводке указано, что 100% записей имеют статус X, в последующих разделах нельзя утверждать, что тем же статусом X обладает другой процент записей, без явного пояснения, что речь идёт о другом временном срезе или другом поле.
+9. ВАЖНО: Не пиши надуманных выводов про «отсутствие автоматизации», «отсутствие теневых режимов», «отсутствие автоматических проверок» и т.п., если этого прямо нет в текстах описаний инцидентов. Гипотезы должны основываться исключительно на реальных фактах из выгрузки и реальном содержании инцидентов, а не на общих шаблонных предположениях об ИТ-системах.
+10. ВАЖНО: Если какая-либо метрика равна нулю, равна 100% по одному значению или иным образом вырождена (например, суммы потерь равны нулю, все записи имеют один и тот же статус), констатируй это как факт БЕЗ домысливания причинно-следственного объяснения этому факту (например, НЕЛЬЗЯ писать, что нулевые потери означают, что 'все ошибки урегулированы' — это не следует логически из данных). Просто укажи значение метрики и, если нужно, предложи это как область для отдельной проверки, а не как готовый вывод.
+"""
+
+    if normalized_skill == "ior_nonfinancial_consequences":
+        global_rules += """11. ВАЖНО: Так как это выгрузка качественных (нефинансовых) последствий, в ней полностью отсутствуют финансовые убытки и возмещения. ТЕБЕ СТРОГО ЗАПРЕЩЕНО писать о финансовых потерях, возмещениях или убытках, а также СТРОГО ЗАПРЕЩЕНО упоминать о том, что финансовых потерь/убытков нет, или писать фразы вроде "финансовых потерь не зафиксировано", "потери равны 0", "нет данных о возмещениях". Вообще никак не касайся финансовой темы и цифр в рублях! Весь анализ должен строиться исключительно на качественных показателях: виды качественных потерь, класс влияния, организационная структура, процессы, связь с рисками информационных систем (ИБ/ИС) и поведенческими рисками.
+"""
+
+    system_prompt += global_rules
+
+    if is_summarization_only:
+        # Strip Section 4 outline from prompt if present to prevent any hallucination
+        for sec4_marker in ("### 4. Аналитические гипотезы для аудиторской проверки", "### 4. Аналитические гипотезы"):
+            if sec4_marker in system_prompt:
+                system_prompt = system_prompt.split(sec4_marker)[0]
+                break
+        system_prompt += f"\n\nВАЖНО: Так как размер выборки мал (выборка содержит менее 20 записей, всего {len(df_analysis)} строк), НЕ ВКЛЮЧАЙ раздел '4. Аналитические гипотезы для аудиторской проверки' и СТРОГО ЗАПРЕЩЕНО формулировать гипотезы. Ограничься только описанием и детальной сводкой текущих {len(df_analysis)} инцидентов. Не придумывай никаких обобщений или гипотез."
+
     user_prompt = f"""Запрос пользователя: "{user_msg}"
 Файл выгрузки: "{file_info.get('name', 'отчет.xlsx')}" ({file_info.get('size', '')}, строк: {len(df_analysis)})
 
@@ -1158,7 +1941,7 @@ async def generate_hypothesis_narrative(user_msg: str, df: pd.DataFrame, file_in
 
 {desc_summary}
 
-Сформулируй гипотезу на основе этих данных. Пиши на русском языке, в профессиональном стиле, доступно и понятно для аналитиков любого уровня."""
+Сформулируй {"суммаризацию" if is_summarization_only else "гипотезу"} на основе этих данных. Пиши на русском языке, в professional стиле, доступно и понятно для аналитиков любого уровня."""
 
     try:
         from local_qwen import ask_local_qwen
@@ -1170,9 +1953,141 @@ async def generate_hypothesis_narrative(user_msg: str, df: pd.DataFrame, file_in
             max_tokens=4096
         )
         
-        narrative = str(raw_response)
+        narrative = str(raw_response).strip()
+        if narrative.startswith("```"):
+            lines = narrative.splitlines()
+            if lines[0].startswith("```"):
+                lines = lines[1:]
+            if lines and lines[-1].startswith("```"):
+                lines = lines[:-1]
+            narrative = "\n".join(lines).strip()
+
+        # Check if model generated duplicate deleted section to replace with code-injected
+        header_pattern = re.compile(r'^(?:#+\s*|\d+\.\s*)(.+)$')
+        lines = narrative.split('\n')
+        cleaned_lines = []
+        skip_section = False
+        for line in lines:
+            match = header_pattern.match(line.strip())
+            if match:
+                header_text = match.group(1).strip().lower()
+                if any(x in header_text for x in ["информация об удаленных", "удаленные инциденты", "анализ удаленных"]):
+                    skip_section = True
+                    logger.warning("Found duplicate deleted section generated by model, stripping it.")
+                else:
+                    skip_section = False
+            if not skip_section:
+                cleaned_lines.append(line)
+        narrative = "\n".join(cleaned_lines)
+
+        # 1. Deduplicate sentences (Task 6)
+        collapsed_narrative = collapse_cyclical_repetitions(narrative)
+        collapsed_narrative, reps = collapse_repeated_sentences(collapsed_narrative)
+        shrank_significantly = len(collapsed_narrative) < 0.8 * len(narrative) or reps > 0
         
-        # Inject information about deleted incidents and retrospective analysis before the hypotheses section (Requirements 8 & 13)
+        # 2. Deduplicate sections (Task 10)
+        collapsed_narrative = collapse_repeated_sections(collapsed_narrative)
+        
+        # 3. Trim extra/blacklisted sections (Task 3 & 12)
+        collapsed_narrative = trim_extra_sections(collapsed_narrative, is_summarization_only)
+        
+        # 4. LLM-as-judge validation (Task 5 & 16)
+        forbidden_fields = []
+        if "financial_consequences_ior" in running_skill:
+            forbidden_fields = ["возмещения", "возмещение", "recovery", "возвраты"]
+
+        validation = await validate_narrative(collapsed_narrative, forbidden_fields)
+        has_violations = (
+            validation.get("autoreg_criticized") or 
+            validation.get("hypotheses_duplicate") or 
+            validation.get("extra_sections") or 
+            validation.get("missing_eve_ids_in_major_incidents") or
+            validation.get("fabricated_thresholds") or
+            validation.get("numbers_inconsistent") or
+            validation.get("unfounded_inference_from_null_data") or
+            validation.get("fields_not_in_dataset")
+        )
+        
+        if has_violations or shrank_significantly:
+            reasons = []
+            if has_violations:
+                reasons.append(f"найдены нарушения: {validation.get('details', '')}")
+            if shrank_significantly:
+                reasons.append("обнаружено зацикливание (repetition loop)")
+                
+            logger.warning(f"Narrative check failed ({'; '.join(reasons)}). Initiating retry...")
+            
+            retry_user_prompt = f"{user_prompt}\n\n"
+            if shrank_significantly:
+                retry_user_prompt += "ВНИМАНИЕ: предыдущая версия твоего ответа содержала критические повторения слов/предложений. Перепиши отчёт с нуля, избегая повторов и зацикливаний.\n"
+            if has_violations:
+                retry_user_prompt += f"ВНИМАНИЕ: предыдущая версия твоего ответа содержала следующие нарушения: {validation.get('details', '')}.\n"
+            
+            retry_user_prompt += f"Вот твой предыдущий ответ (частично очищенный):\n{collapsed_narrative}\n\nПерепиши отчёт с нуля, устранив эти проблемы, не потеряв остальные требования структуры и стиля."
+            
+            try:
+                raw_response = await asyncio.to_thread(
+                    ask_local_qwen, [
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": retry_user_prompt}
+                    ],
+                    max_tokens=4096
+                )
+                retry_narrative = str(raw_response).strip()
+                if retry_narrative.startswith("```"):
+                    lines = retry_narrative.splitlines()
+                    if lines[0].startswith("```"):
+                        lines = lines[1:]
+                    if lines and lines[-1].startswith("```"):
+                        lines = lines[:-1]
+                    retry_narrative = "\n".join(lines).strip()
+                
+                # Strip model deleted section again
+                lines = retry_narrative.split('\n')
+                cleaned_lines = []
+                skip_section = False
+                for line in lines:
+                    match = header_pattern.match(line.strip())
+                    if match:
+                        header_text = match.group(1).strip().lower()
+                        if any(x in header_text for x in ["информация об удаленных", "удаленные инциденты", "анализ удаленных"]):
+                            skip_section = True
+                        else:
+                            skip_section = False
+                    if not skip_section:
+                        cleaned_lines.append(line)
+                retry_narrative = "\n".join(cleaned_lines)
+                
+                retry_narrative = collapse_cyclical_repetitions(retry_narrative)
+                collapsed_narrative, reps = collapse_repeated_sentences(retry_narrative)
+                collapsed_narrative = collapse_repeated_sections(collapsed_narrative)
+                collapsed_narrative = trim_extra_sections(collapsed_narrative, is_summarization_only)
+                
+                validation_retry = await validate_narrative(collapsed_narrative, forbidden_fields)
+                has_violations_retry = (
+                    validation_retry.get("autoreg_criticized") or 
+                    validation_retry.get("hypotheses_duplicate") or 
+                    validation_retry.get("extra_sections") or 
+                    validation_retry.get("missing_eve_ids_in_major_incidents") or
+                    validation_retry.get("fabricated_thresholds") or
+                    validation_retry.get("numbers_inconsistent") or
+                    validation_retry.get("unfounded_inference_from_null_data") or
+                    validation_retry.get("fields_not_in_dataset")
+                )
+                if has_violations_retry:
+                    logger.warning(f"Violations still found after retry: {validation_retry.get('details')}. Returning text as is.")
+            except Exception as retry_err:
+                logger.error(f"Error during retry generation: {retry_err}")
+                
+        narrative = collapsed_narrative
+            
+        # Post-process cleanup to ensure no Section 4 is generated if summarization only
+        if is_summarization_only:
+            for marker in ("### 4.", "4. Аналитические гипотезы", "Аналитические гипотезы"):
+                if marker in narrative:
+                    narrative = narrative.split(marker)[0].strip()
+        
+        # Inject information about deleted incidents and retrospective analysis before the hypotheses section
         combined_inject = deleted_text + retro_text
         if "### 4." in narrative:
             parts = narrative.split("### 4.", 1)
@@ -1187,11 +2102,17 @@ async def generate_hypothesis_narrative(user_msg: str, df: pd.DataFrame, file_in
             narrative += "\n\n### Визуализация аналитики\n"
             narrative += f"\n![Динамика потерь и инцидентов](/api/files/{chart_file_id}/raw)\n"
             
-        return narrative
+        # Clean up huge empty lines (3 or more newlines) between paragraphs
+        narrative = re.sub(r'\n{3,}', '\n\n', narrative)
+        # Apply frontend markdown normalization
+        narrative = normalize_markdown_for_frontend(narrative)
+        return narrative.strip()
     except Exception as e:
         logger.exception(f"Error generating hypothesis: {e}")
-        # fallback narrative
         parts = [prefix, deleted_text, retro_text, "✅ Готово."]
         if file_info:
             parts.append(f"\n\n📁 Сформирован файл: **{file_info.get('name')}** (строк: {len(df_analysis)})")
-        return "".join(parts)
+        res = "".join(parts)
+        res = re.sub(r'\n{3,}', '\n\n', res)
+        res = normalize_markdown_for_frontend(res)
+        return res.strip()

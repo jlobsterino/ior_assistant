@@ -43,7 +43,7 @@ import pyspark.sql.functions as F
 from backend.agent.agent_flow import run_agent
 from backend.agent.flow import relay_to_ws, with_heartbeat
 from backend.storage.database import SessionRepo, get_db
-from local_qwen import extract_search_params
+from backend.gigachat_extractor import extract_search_params
 from backend.IOR_pipeline_search import build_and_cache_small_index, search_small_index, _SMALL_FAISS_SESSION_CACHE
 
 _spark_session = None
@@ -137,7 +137,7 @@ async def chat_stream(req: ChatRequest):
 from backend.pipeline_search import search_pipeline as run_complaints_pipeline
 from backend.pipeline_search import faiss_loaded, bm25_indexes
 from backend.gigachat_extractor import summarize_complaints
-from backend.storage.database import MessageRepo, SessionRepo
+from backend.storage.database import MessageRepo, SessionRepo, FileRepo, get_db
 from backend. IOR_pipeline_search import search_pipeline as run_ior_pipeline
 from local_qwen import summarize_iors
 # - WebSocket endpoint (default dna prod / DataLab)
@@ -197,7 +197,6 @@ async def chat_ws(websocket: WebSocket):
         is_ior = (mode == "ior_pipeline")
 
         if is_complaint:
-            from backend.storage.database import FileRepo, get_db
             from backend.agent.complaint_hypothesis import (
                 _determine_complaint_route,
                 _COMPLAINTS_SESSION_CACHE,
@@ -259,8 +258,10 @@ async def chat_ws(websocket: WebSocket):
                     id_to_text_map = {}
                     for _, row in df_result.iterrows():
                         cid = str(row.get('id', ''))
-                        desc = row.get('Короткое описание', '')
-                        dialogue = row.get('Транскрибация диалога', '')
+                        desc_raw = row.get('Короткое описание', '')
+                        dialogue_raw = row.get('Транскрибация диалога', '')
+                        desc = '' if pd.isna(desc_raw) else str(desc_raw)
+                        dialogue = '' if pd.isna(dialogue_raw) else str(dialogue_raw)
                         date_str = row.get('date', '')
                         if cid:
                             id_to_text_map[cid] = {
@@ -333,6 +334,12 @@ async def chat_ws(websocket: WebSocket):
 
                     preview_k = params["top_k"] or 5
                     top_n = df_result.head(preview_k).copy()
+                    if "Транскрибация диалога" in top_n.columns:
+                        top_n = top_n.drop(columns=["Транскрибация диалога"])
+                    if "Короткое описание" in top_n.columns:
+                        top_n["Короткое описание"] = top_n["Короткое описание"].apply(
+                            lambda x: (str(x)[:30] + "...") if x and len(str(x)) > 30 else (str(x) if x else "-")
+                        )
                     top_n.insert(0, 'Ранг релевантности', range(1, len(top_n) + 1))
 
                     sample_headers = list(top_n.columns)
@@ -362,6 +369,18 @@ async def chat_ws(websocket: WebSocket):
                         df=df_result,
                         file_info=file_info
                     )
+
+                    # Save hypothesis in complaints session cache
+                    if session_id in _COMPLAINTS_SESSION_CACHE:
+                        _COMPLAINTS_SESSION_CACHE[session_id]["hypothesis"] = summary_text
+                    else:
+                        _COMPLAINTS_SESSION_CACHE[session_id] = {
+                            "id_to_text_map": id_to_text_map,
+                            "hypothesis": summary_text
+                        }
+
+                    # Update history cache
+                    update_session_history(session_id, message, summary_text)
 
                     # Stream narrative token by token to chat
                     chunk_size = 4
@@ -475,6 +494,44 @@ async def chat_ws(websocket: WebSocket):
                         if str(cid).lower() in message.lower():
                             id_matches.append(cid)
 
+                    # Also extract any other 10-20 digit IDs from message and fetch them from Spark if needed
+                    digits_found = re.findall(r'\b\d{10,20}\b', message)
+                    new_ids_to_fetch = []
+                    for df_id in digits_found:
+                        if df_id not in id_to_text_map and df_id not in id_matches:
+                            new_ids_to_fetch.append(df_id)
+
+                    if new_ids_to_fetch:
+                        logger.info(f"[COMPLAINT ID FETCH] Fetching new IDs from Spark: {new_ids_to_fetch}")
+                        try:
+                            from backend.pipeline_search import load_complaints_data_from_spark
+                            new_df = load_complaints_data_from_spark(new_ids_to_fetch)
+                            for _, row in new_df.iterrows():
+                                cid = str(row.get('id', ''))
+                                desc_raw = row.get('req_desc', '')
+                                dialogue_raw = row.get('msg_pprb_chat', '')
+                                desc = '' if pd.isna(desc_raw) else str(desc_raw)
+                                dialogue = '' if pd.isna(dialogue_raw) else str(dialogue_raw)
+                                if cid:
+                                    date_str = ""
+                                    try:
+                                        from backend.pipeline_search import id_to_index, req_reg_dates
+                                        idx = id_to_index.get(cid)
+                                        if idx is not None:
+                                            date_str = req_reg_dates[idx] or ""
+                                    except Exception:
+                                        pass
+                                    
+                                    id_to_text_map[cid] = {
+                                        "id": cid,
+                                        "desc": desc,
+                                        "dialogue": dialogue,
+                                        "date": date_str
+                                    }
+                                    id_matches.append(cid)
+                        except Exception as e:
+                            logger.error(f"[COMPLAINT ID FETCH] Failed to fetch direct IDs: {e}")
+
                     if id_matches:
                         await websocket.send_text(json.dumps(
                             make_status_payload("generating", "✍️ Формирую детальный анализ по обращениям...", "active"),
@@ -486,7 +543,8 @@ async def chat_ws(websocket: WebSocket):
                                 answer_complaint_details,
                                 user_query=message,
                                 complaints=matched_complaints,
-                                history=history
+                                history=history,
+                                hypothesis=session_data.get("hypothesis")
                             )
                         except Exception as e:
                             logger.error(f"[COMPLAINT FOLLOW_UP] answer_complaint_details failed: {e}")
@@ -514,7 +572,8 @@ async def chat_ws(websocket: WebSocket):
                                     answer_complaint_follow_up,
                                     user_query=message,
                                     complaints=matched_list,
-                                    history=history
+                                    history=history,
+                                    hypothesis=session_data.get("hypothesis")
                                 )
                             except Exception as e:
                                 logger.error(f"[COMPLAINT FOLLOW_UP] answer_complaint_follow_up failed: {e}")
@@ -528,7 +587,8 @@ async def chat_ws(websocket: WebSocket):
                                 response_text = await asyncio.to_thread(
                                     answer_complaint_dialog,
                                     user_query=message,
-                                    history=history
+                                    history=history,
+                                    hypothesis=session_data.get("hypothesis")
                                 )
                             except Exception as e:
                                 logger.error(f"[COMPLAINT FOLLOW_UP] answer_complaint_dialog failed: {e}")
@@ -601,7 +661,7 @@ async def chat_ws(websocket: WebSocket):
                 bm25_indexes,
             )
             from backend.agent.agent_flow import run_agent
-            from backend.storage.database import FileRepo, MessageRepo, SessionRepo, get_db
+            from backend.storage.database import FileRepo, get_db
 
             async def send_fallback_activity(websocket, aid: str, kind: str, title: str, detail: str = None, status: str = "active"):
                 payload = {
@@ -841,12 +901,102 @@ async def chat_ws(websocket: WebSocket):
                             df_spark = spark.table(table_name)
                             # Поиск колонки incdnt_sid без учета регистра в Spark
                             incdnt_sid_col = next((c for c in df_spark.columns if c.lower() == "incdnt_sid"), "incdnt_sid")
-                            df_filtered = df_spark.filter(df_spark[incdnt_sid_col].isin(target_ids))
+                            
+                            # Фикс type mismatch (string vs numeric)
+                            from IOR_pipeline_search import get_id_variations
+                            all_target_variations = set()
+                            for idx_sid in target_ids:
+                                for var in get_id_variations(idx_sid):
+                                    all_target_variations.add(var)
+                                    # Also add string version
+                                    all_target_variations.add(str(var))
+                            
+                            target_ids_list = list(all_target_variations)
+                            
+                            df_filtered = df_spark.filter(df_spark[incdnt_sid_col].isin(target_ids_list))
                             df_pandas = await asyncio.to_thread(df_filtered.toPandas)
+                            
+                            # Rename columns to Cyrillic names for custom exports (Point 1.3 user request)
+                            CYRILLIC_RENAME = {
+                                'incdnt_id': 'Идентификационный ключ инцидента операционного риска',
+                                'incdnt_sid': 'Идентификатор события',
+                                'incdnt_status_name': 'Статус события',
+                                'incdnt_autoreg_flag': 'Признак авторегистрации инцидента',
+                                'incdnt_detection_person_name': 'Кем выявлено событие',
+                                'incdnt_source_name': 'Название источника',
+                                'src_type_lvl_1_name': 'Тип источника инцидента (уровень 1)',
+                                'src_type_lvl_2_name': 'Тип источника инцидента (уровень 2)',
+                                'incdnt_type_lvl_1_name': 'Тип события – уровень 1',
+                                'incdnt_type_lvl_2_name': 'Тип события – уровень 2',
+                                'incdnt_detection_dt': 'Дата обнаружения (Событие)',
+                                'incdnt_start_dt': 'Дата начала инцидента операционного риска',
+                                'incdnt_entry_dt': 'Дата ввода (Событие)',
+                                'incdnt_first_validated_dttm': 'Дата первого подтверждения',
+                                'incdnt_last_validate_dttm': 'Дата последнего подтверждения',
+                                'risk_profile_id': 'Идентификатор профиля риска',
+                                'risk_profile_name': 'Наименование профиля риска',
+                                'incdnt_client_type_name': 'Тип клиента',
+                                'incdnt_mistake_cnt': 'Количество ошибок',
+                                'incdnt_appl_num': 'Номер заявки',
+                                'incdnt_agr_num': 'Номер договора',
+                                'incdnt_agr_sid': 'Идентификатор договора',
+                                'incdnt_summary_descr_txt': 'Предварительное описание',
+                                'incdnt_full_descr_txt': 'Подробное описание',
+                                'org_struct_id': 'Идентификатор оргструктуры',
+                                'org_struct_lvl_2_name': 'Орг. структура – уровень 2 (Терр. структура / Департамент ДЗО)',
+                                'org_struct_lvl_3_name': 'Орг. структура – уровень 3 (Блок / ТБ / ПЦП)',
+                                'org_struct_lvl_4_name': 'Орг. структура – уровень 4 (Дивизион / Департамент)',
+                                'org_struct_lvl_5_name': 'Орг. структура – уровень 5',
+                                'org_struct_lvl_6_name': 'Орг. структура – уровень 6',
+                                'org_struct_lvl_7_name': 'Орг. структура – уровень 7',
+                                'org_struct_lvl_8_name': 'Орг. структура – уровень 8',
+                                'org_struct_lvl_9_name': 'Орг. структура – уровень 9',
+                                'org_struct_lvl_10_name': 'Орг. структура – уровень 10',
+                                'funct_block_id': 'Идентификатор функционального блока',
+                                'funct_block_lvl_2_name': 'Функциональный блок – уровень 2',
+                                'funct_block_lvl_3_name': 'Функциональный блок – уровень 3',
+                                'funct_block_lvl_4_name': 'Функциональный блок – уровень 4',
+                                'process_lvl_1_name': 'Процесс – уровень 1',
+                                'process_lvl_2_name': 'Процесс – уровень 2',
+                                'process_lvl_3_name': 'Процесс – уровень 3',
+                                'process_lvl_4_name': 'Процесс – уровень 4 (Наименование процесса)',
+                                'clntpth_lvl_4_name': 'Клиентский путь – уровень 4',
+                                'busn_area_id': 'Идентификационный ключ направления деятельности',
+                                'busn_area_lvl_1_name': 'Направление деятельности банка',
+                                'busn_area_lvl_2_name': 'Поднаправление деятельности банка',
+                                'incdnt_security_risk_flag': 'Связь с ИБ-риском',
+                                'incdnt_infrmtn_sys_risk_flag': 'Связь с риском информационных систем',
+                                'incdnt_behavior_risk_flag': 'Связь с поведенческим риском',
+                                'incdnt_model_risk_flag': 'Связь с модельным риском',
+                                'incdnt_sum': 'Общая сумма всех последствий (руб.)',
+                                'incdnt_drct_dmg_sum': 'Прямая потеря – итого (руб.)',
+                                'incdnt_drct_dmg_cred_rub_amt': 'Прямая потеря – с кредитным риском (руб.)',
+                                'incdnt_drct_dmg_noncred_rub_amt': 'Прямая потеря – без кредитного риска (руб.)',
+                                'incdnt_indrct_dmg_sum': 'Косвенная потеря – итого (руб.)',
+                                'incdnt_indrct_dmg_cred_rub_amt': 'Косвенная потеря – с кредитным риском (руб.)',
+                                'incdnt_indrct_dmg_noncred_rub_amt': 'Косвенная потеря – без кредитного риска (руб.)',
+                                'incdnt_unrlzd_dmg_sum': 'Нереализовавшаяся потеря – итого (руб.)',
+                                'incdnt_unrlzd_dmg_cred_rub_amt': 'Нереализовавшаяся потеря – с кредитным риском (руб.)',
+                                'incdnt_unrlzd_dmg_noncred_rub_amt': 'Нереализовавшаяся потеря – без кредитного риска (руб.)',
+                                'incdnt_thrd_prt_sum': 'Потеря третьих лиц – итого (руб.)',
+                                'incdnt_thrd_prt_cred_rub_amt': 'Потеря третьих лиц – с кредитным риском (руб.)',
+                                'incdnt_thrd_prt_noncred_rub_amt': 'Потеря третьих лиц – без кредитного риска (руб.)',
+                                'incdnt_gain_sum': 'Прибыль – итого (руб.)',
+                                'incdnt_gain_cred_rub_amt': 'Прибыль – с кредитным риском (руб.)',
+                                'incdnt_gain_noncred_rub_amt': 'Прибыль – без кредитного риска (руб.)',
+                                'recovery_rub_amt_aggr': 'Возмещение – итого по инциденту (руб.)'
+                            }
+                            
                             try:
-                                df_pandas.columns = [str(c).lower() for c in df_pandas.columns]
-                            except Exception as e:
-                                logger.warning("[DIRECT_EXPORT] Failed to normalize columns: %s", e)
+                                rename_dict = {}
+                                for col in df_pandas.columns:
+                                    col_str = str(col).strip().lower()
+                                    if col_str in CYRILLIC_RENAME:
+                                        rename_dict[col] = CYRILLIC_RENAME[col_str]
+                                if rename_dict:
+                                    df_pandas = df_pandas.rename(columns=rename_dict)
+                            except Exception as rename_err:
+                                logger.warning("[DIRECT_EXPORT] Failed to rename columns: %s", rename_err)
                             total_rows = len(df_pandas)
                             logger.info(f"[DIRECT_EXPORT] Загружено из Spark: {total_rows}")
 

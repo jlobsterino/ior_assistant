@@ -8,64 +8,63 @@ try:
 except ImportError:
     pass
 
-import subprocess
-
-import bm25s
-import re
-import numpy as np
-import faiss
-import pandas as pd
-from sentence_transformers import SentenceTransformer, CrossEncoder
-from keybert import KeyBERT
-import torch
 import os
+import re
 import time
+import json
 import pickle
 import sqlite3
+import subprocess
+import numpy as np
+import pandas as pd
+import faiss
+import bm25s
+from sentence_transformers import SentenceTransformer, CrossEncoder
+from keybert import KeyBERT
 
+# Настройки окружения
 os.environ["TORCHDYNAMO"] = "0"
-#os.environ["TORCHINDUCTOR_CACHE_DIR"] = "/home/datalab/nfs/d3/d3_code/torchinductor_cache"
-#torch._inductor.config.enabled = False
+# os.environ["TORCHINDUCTOR_CACHE_DIR"] = "/home/datalab/nfs/d3/d3_code/torchinductor_cache"
+# torch._inductor.config.enabled = False
 
-BM25_CHUNK = 500000
-
-path_to_load = "/home/datalab/nfs/disrupt_tester_clean/caches/cache_1000k"
+# Константы и пути
+BM25_CHUNK = 1000000
+path_to_load = "/home/datalab/nfs/d3/d3_code/cache_le_finale2"
 DB_PATH = "/home/datalab/nfs/disrupt_testerv2/backend/storage/cache.db"
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 print(DEVICE)
 
-import builtins
-if not hasattr(builtins, "ior_shared_cache"):
-    builtins.ior_shared_cache = {}
-cache = builtins.ior_shared_cache
+print("Загрузка BGE-M3...")
+EMBED_MODEL = SentenceTransformer("/home/datalab/nfs/BAAI:bge-m3", device=DEVICE)
+EMBED_MODEL.to(DEVICE)
 
-if "EMBED_MODEL" in cache:
-    print("Использую кэшированный BGE-M3...")
-    EMBED_MODEL = cache["EMBED_MODEL"]
-    KW_MODEL = cache["KW_MODEL"]
-    DIM = cache["DIM"]
-    reranker = cache["reranker"]
-else:
-    print("Загрузка BGE-M3...")
-    EMBED_MODEL = SentenceTransformer("/home/datalab/nfs/BAAI:bge-m3", device=DEVICE)
-    EMBED_MODEL.to(DEVICE)
-    KW_MODEL = KeyBERT(model=EMBED_MODEL)
-    DIM = EMBED_MODEL.get_sentence_embedding_dimension()
-    print(f"Готово. Размерность вектора: {DIM}")
-    reranker = CrossEncoder("/home/datalab/nfs/bge-reranker-v2-m3", device=DEVICE)
-    
-    cache["EMBED_MODEL"] = EMBED_MODEL
-    cache["KW_MODEL"] = KW_MODEL
-    cache["DIM"] = DIM
-    cache["reranker"] = reranker
+KW_MODEL = KeyBERT(model=EMBED_MODEL)
+DIM = EMBED_MODEL.get_sentence_embedding_dimension()
+print(f"Готово. Размерность вектора: {DIM}")
 
-def build_text(req_desc: str, msg_pprb_chat: str):
+reranker = CrossEncoder("/home/datalab/nfs/bge-reranker-v2-m3", device=DEVICE)
+
+K_RRF = 60
+ALPHA = 0.3
+TOP_K_RERANK = 50
+DEFAULT_TOP_K = 250
+SCORE_THRESHOLD = 0.5
+
+# Глобальные переменные для метаданных
+_db_conn = None
+doc_ids = []
+id_to_index = {}
+req_reg_dates = []
+
+
+# Вспомогательные функции
+def build_text(req_desc: str, msg_pprb_chat: str) -> str:
     parts = []
     if req_desc and str(req_desc).strip():
         parts.append(str(req_desc))  # Убедитесь, что это строка
     if msg_pprb_chat and str(msg_pprb_chat).strip():
-        parts.append(str(msg_pprb_chat)) # Убедитесь, что это строка
+        parts.append(str(msg_pprb_chat))  # Убедитесь, что это строка
     return " ".join(parts)
 
 
@@ -91,8 +90,7 @@ def embed(texts, batch_size=48, log_every=50000):
             normalize_embeddings=True,
             convert_to_numpy=True,
             batch_size=batch_size,
-            # device="cuda",
-            device="cpu",
+            device=DEVICE,
             chunk_size=200,
             show_progress_bar=False
         )
@@ -105,315 +103,360 @@ def embed(texts, batch_size=48, log_every=50000):
             while next_log <= processed:
                 next_log += log_every
 
-    # Очистка каждые ~100k эмбеддингов
-    if len(all_embeddings) >= 10:
-        all_embeddings = [np.vstack(all_embeddings)]
+        # Очистка каждые ~100k эмбеддингов
+        if len(all_embeddings) >= 10:
+            all_embeddings = [np.vstack(all_embeddings)]
     return np.vstack(all_embeddings).astype("float32")
-
-
-# функция решает сколько ключевых слов добавлять
-def get_top_n(text):
-    tokens = re.findall(r"[а-яёa-z0-9]+", text.lower())
-    length = len(tokens)
-    if length < 20:
-        return 2
-    elif length < 50:
-        return 3
-    else:
-        return 4
-
-DIALOG_STOP_WORDS_RAW = ['!num!', 'OPERATOR:', 'CHATBOT', '!fio!', 'CLIENT', 'sdk_request']
-DIALOG_STOP_WORDS = [re.sub(r"[^а-яёa-z0-9]", "", word.lower().strip()) for word in DIALOG_STOP_WORDS_RAW]
-DIALOG_STOP_WORDS = [word for word in DIALOG_STOP_WORDS if word]
-
-
-def extract_keywords(text, req_desc=None, msg_pprb_chat=None):
-    # устанавливаем доминирование req_desc при выборе ключевых фраз (может наоборот поставить: если pprb есть то только в этом случае...)
-    if req_desc and str(req_desc).strip():
-        if msg_pprb_chat and str(msg_pprb_chat).strip():
-            text = (str(req_desc) + " ") * 1 + text # то есть req desc будет 2 раза
-    
-    min_score = 0.2
-    top_n = get_top_n(text)
-    all_candidates = KW_MODEL.extract_keywords(
-        text, 
-        keyphrase_ngram_range=(1, 3), 
-        stop_words=DIALOG_STOP_WORDS, 
-        use_mmr=True, 
-        diversity=0.7, 
-        top_n=top_n * 3
-    )
-    
-    adjusted = []
-    for kw, score in all_candidates:
-        word_count = len(kw.split())
-        # Штраф: длинная фраза теряет всего 5-15% веса
-        # 1 слово: x1.0, 2 слова: x0.95, 3 слова: x0.90, 4 слова: x0.85
-        penalty = 1.0 - (word_count - 1) * 0.05
-        adjusted_score = score * penalty
-        # фильтр по качеству (если фраза имеет слишком малый скор, не берем ее)
-        if adjusted_score >= min_score:
-            adjusted.append((kw, adjusted_score, word_count))
-    adjusted.sort(key=lambda x: x[1], reverse=True)
-
-    # Убираем дубликаты по корню
-    result = []
-    seen_roots = set()
-    for kw, score, wc in adjusted:
-        root = tuple(kw.split()[:2])
-        if root not in seen_roots:
-            result.append(kw)
-            seen_roots.add(root)
-            if len(result) >= top_n:
-                break
-    return result
 
 
 def load_embeddings(path=path_to_load):
     meta_path = f"{path}/embeddings_meta.pkl"
-
     if os.path.exists(meta_path):
         with open(meta_path, 'rb') as f:
             meta = pickle.load(f)
         embeddings = np.memmap(meta["path"], dtype=meta["dtype"], mode='r', shape=meta["shape"])
         print(f"Эмбеддинги загружены через memmap: {meta['shape']}")
         return embeddings
-    else:
-        # fallback на старый способ (если вдруг)
-        print("Memmap не найден, загружаем старый pickle...")
-        with open(f"{path}/embeddings.pkl", "rb") as f:
-            embeddings = pickle.load(f)
-        return np.ascontiguousarray(embeddings.astype("float32"))
+    return None
 
 
-import sqlite3
-
-DB_PATH = "/home/datalab/nfs/disrupt_testerv2/backend/storage/cache.db"
-_db_conn=None
-
-
+# Функции загрузки метаданных и индексов
 def load_meta(path=path_to_load):
-    global documents, doc_ids, tokenized_corpus, id_to_index, req_descs, msg_pprb_chats, req_reg_dates
-    with open(f"{path}/meta.pkl", "rb") as f:
-        meta = pickle.load(f)
-    documents = meta["documents"]
-    doc_ids = meta["doc_ids"]
-    tokenized_corpus = meta["tokenized_corpus"]
-    id_to_index = meta["id_to_index"]
-    req_descs = meta["req_descs"]
-    msg_pprb_chats = meta["msg_pprb_chats"]
-    req_reg_dates = meta.get("req_reg_dates", [None] * len(documents))
-    print("meta успешно загружена!")
-    print(f"Количество документов: {len(documents)}")
+    global doc_ids, id_to_index, req_reg_dates
+    meta_path = f"{path}/meta_final.pkl" if os.path.exists(f"{path}/meta_final.pkl") else f"{path}/meta.pkl"
+    if os.path.exists(meta_path):
+        with open(meta_path, "rb") as f:
+            meta = pickle.load(f)
+        doc_ids = meta.get("doc_ids", [])
+        id_to_index = meta.get("id_to_index", {})
+        req_reg_dates = meta.get("req_reg_dates", [None] * len(doc_ids))
+        print("мета успешно загружена!")
+        print(f"Количество документов: {len(doc_ids)}")
+    else:
+        print(f"Warning: Meta file not found at {meta_path}")
 
 
 def load_indices(path=path_to_load, to_gpu=False):
-    faiss_index = faiss.read_index(f"{path}/faiss_index")
-    if to_gpu:
-        try:
-            res = faiss.StandardGpuResources()
-            faiss_index = faiss.index_cpu_to_gpu(res, 0, faiss_index)
-        except Exception as e: 
-            print("GPU error:", e)
-    print("FAISS index загружен")
-    return faiss_index # bm25s загружается динамически, старые bm25.pkl не нужны
-
-
-if "p_meta" in cache:
-    print("Использую кэшированные meta/faiss для pipeline_search...")
-    meta_dict = cache["p_meta"]
-    documents = meta_dict["documents"]
-    doc_ids = meta_dict["doc_ids"]
-    tokenized_corpus = meta_dict["tokenized_corpus"]
-    id_to_index = meta_dict["id_to_index"]
-    req_descs = meta_dict["req_descs"]
-    msg_pprb_chats = meta_dict["msg_pprb_chats"]
-    req_reg_dates = meta_dict.get("req_reg_dates", [None] * len(documents))
-    
-    faiss_loaded = cache["p_faiss_loaded"]
-else:
-    load_meta()
-    meta_dict = {
-        "documents": documents,
-        "doc_ids": doc_ids,
-        "tokenized_corpus": tokenized_corpus,
-        "id_to_index": id_to_index,
-        "req_descs": req_descs,
-        "msg_pprb_chats": msg_pprb_chats,
-        "req_reg_dates": req_reg_dates,
-    }
-    faiss_loaded = load_indices(to_gpu=False)
-    
-    cache["p_meta"] = meta_dict
-    cache["p_faiss_loaded"] = faiss_loaded
-
-K_RRF = 60
-ALPHA = 0.3 # вес BM25 в финальном скоре
-TOP_K_RERANK = 50
-DEFAULT_TOP_K = 10
-SCORE_THRESHOLD = 0.5
-
-
-def filter_candidates_by_date(candidate_ids, date_range=None):
-    if date_range is None: # если пользователь не указал дату - ничего не фильтруем
-        return candidate_ids
-    start_date = str(date_range[0])
-    end_date = str(date_range[1])
-    filtered = [] # сюда будут записываться подходящие по дате кандидаты
-    for cid in candidate_ids: # идем по кандидатам
-        idx = id_to_index.get(cid) # получаем индекс документа; это нужно, т.к. cid - настоящий id обращения, а idx - его позиция в массивах
-        if idx is None: # проверяем, найден ли документ
-            continue
-        date_str = req_reg_dates[idx] # получаем дату документа
-        if date_str is None: # проверяем пустую дату - если дата отсутствует, то пропускаем документ
-            continue
-        if start_date <= date_str <= end_date: # если дата соответствует, то добавляем в список подходящих кандидатов
-            filtered.append(cid)
-    return filtered
+    index_path = f"{path}/faiss_index"
+    if os.path.exists(index_path):
+        faiss_index = faiss.read_index(index_path)
+        if to_gpu:
+            try:
+                res = faiss.StandardGpuResources()
+                faiss_index = faiss.index_cpu_to_gpu(res, 0, faiss_index)
+            except Exception as e:
+                print("GPU error:", e)
+        print("FAISS index загружен")
+        return faiss_index
+    return None
 
 
 def load_bm25s_shards(bm25_dir):
-    """Функция загружает bm25s шарды один раз при старте, что кратно убыстряет запросы"""
-    bm25_indexes = [] # сюда будем складывать загруженные индексы
-    # находим все шарды в папке
+    """Функция загружает BM25 шарды один раз при старте, что кратно убыстряет запросы"""
+    if not os.path.exists(bm25_dir):
+        print(f"Warning: BM25 directory '{bm25_dir}' does not exist.")
+        return []
+    bm25_indexes = []  # сюда будем складывать загруженные индексы
     shards = sorted([f for f in os.listdir(bm25_dir) if f.startswith("shard_")])
-    for shard in shards: # проходимся по всем шардам
-        shard_id = int(shard.split("_")[1]) # из имени "shard_0" (и прочее) достаем номер шарда
-        offset = shard_id * BM25_CHUNK # считаем сдвиг шарда; для шарда с номером 1 он равен 500 000 при размере шарда BM25_CHUNK
-        bm25_index = bm25s.BM25.load(f"{bm25_dir}/{shard}", load_corpus=False) # загружаем индекс в память
-        bm25_indexes.append((bm25_index, offset)) # сохраняем пару (индекс; сдвиг)
+    for shard in shards:
+        shard_id = int(shard.split("_")[1])  # из имени "shard_0" (и прочее) достаем номер шарда
+        offset = shard_id * BM25_CHUNK  # считаем сдвиг шарда
+        bm25_index = bm25s.BM25.load(f"{bm25_dir}/{shard}", load_corpus=False)  # загружаем индекс в память
+        bm25_indexes.append((bm25_index, offset))  # сохраняем пару (индекс; сдвиг)
     print("BM25 shards загружены:", len(bm25_indexes))
     return bm25_indexes
 
 
-def retrieve_hybrid_adaptive(query, faiss_idx, bm25_indexes, target_k=50, date_range=None):
+# Инициализация метаданных и индексов при запуске
+if os.path.exists(path_to_load):
+    load_meta()
+    faiss_loaded = load_indices(to_gpu=False)
+else:
+    print(f"Warning: path_to_load '{path_to_load}' does not exist. Skipping metadata loading.")
+    faiss_loaded = None
+
+bm25_dir = f"{path_to_load}/bm25s_shards2"
+if os.path.exists(bm25_dir):
+    bm25_indexes = load_bm25s_shards(bm25_dir)
+else:
+    bm25_indexes = []
+
+
+def build_date_mask(date_range=None):
+    if date_range is None:
+        return None
+    start_date = str(date_range[0])
+    end_date = str(date_range[1])
+    return np.array([isinstance(date, str) and start_date <= date <= end_date for date in req_reg_dates], dtype=bool)
+
+
+def prepare_texts_for_metrics(df: pd.DataFrame) -> list:
+    texts_needed = []
+    # Нумеруем с 1, чтобы соответствовать ожиданиям промпта
+    for idx, (_, row) in enumerate(df.iterrows(), start=1):
+        short = row.get("Короткое описание")
+        msg = row.get("Транскрибация диалога")
+        parts = []
+        if short is not None and str(short).strip() != '':
+            parts.append(f"Короткое описание обращения номер {idx}: {short}")
+        if msg is not None and str(msg).strip() != '':
+            parts.append(f"Транскрибация обращения номер {idx}: {msg}")
+        
+        combined_text = "\n".join(parts)
+        texts_needed.append(combined_text)
+    return texts_needed
+
+
+def batch_classify_sva_metrics(texts: list, batch_size=8) -> list:
+    from backend.gigachat_extractor import def_ask_gigachat
+    
+    results = []
+    for i in range(0, len(texts), batch_size):
+        batch = texts[i:i + batch_size]
+        
+        batch_prompt = f"""Ты профессионал по работе с клиентскими обращениями. Запомни метрики и их классификацию в рамках клиентского сервиса.
+'101': 'Финансовые потери клиентов по вине Банка / компании Группы Выявлены отклонения и проблемы в клиентском сервисе, связанные с недостатками процессов Банка и повлекшие возникновение финансовых потерь у клиентов (избыточное взимание процентов и комиссий, некорректное применение тарифов, некорректное списание денежных средств со счетов клиентов, некорректное начисление бонусов в рамках программ лояльности, обмен валюты по некорректному курсу и др.).\\nНапример:\\n- Неправомерно начислена неустойка за несвоевременное предоставление документов по целевому использованию кредита/страхование объекта недвижимости при фактическом их наличии;\\n- Клиентам при открытии вкладов были установлены процентные ставки ниже действующих на дату открытия вклада.',
+'102': 'Необоснованный отказ в оказании услуги Выявлены отклонения и проблемы в клиентском сервисе, связанные с необоснованным отказом в оказании услуги либо непредоставление услуги из-за недостатков процессов Банка.\\nНапример:\\n- Клиенты не смогли провести оплату товаров / услуг в сети интернет с использованием сервиса SberPay из-за технических сбоев в мобильном приложении СберБанк онлайн (далее - СБОЛ) / на сайтах партнеров.\\n- Банк необоснованно отказал Клиентам в увеличении лимита по кредитным картам. ',
+'103': 'Нарушение срока оказания услуги\\n Выявлены отклонения и проблемы в клиентском сервисе, связанные с нарушением срока оказания услуг/сервисов Банка.\\nНапример:\\n- превышены сроки выпуска/доставки предоставление ответа на обращение за допустимое время, затягивание сроков обслуживания клиентов, нарушение сроков оказания услуг, оказания услуг/сервисов Банка. \\nНапример:\\n- превышены сроки выпуска/доставки банковских карт\\n- депозитные сделки оформлены с нарушением срока в среднем на 3 часа (норматив не более 1 часа). ',
+'104': 'Нарушение стандартов коммуникации с клиентами Выявлены отклонения и проблемы в клиентском сервисе, связанные с нарушениями стандартов коммуникации с клиентами (Внутренний стандарт по коммуникации с розничными клиентами ПАО Сбербанк от 21.11.2024 №4762-2) по любому доступному каналу связи: СМС, PUSH-уведомления, коммуникации по телефону, чат-бот, очное взаимодействие в каналах Банка, информирование на сайте Банка и в СБОЛ, повлекшие за собой финансовые потери клиента либо отказ клиента от продукта.\\nНапример:\\n- Клиенту не поступила СМС/PUSH о необходимости пополнения счета и Клиент вышел на просрочку по ипотечному кредиту\\n- Клиенту не пришла СМС/PUSH с кодом для входа в мобильное приложение СБОЛ.',
+'105': 'Недобросовестные практики продаж Выявлены нарушения требований ФЗ и регуляторов в части применения недобросовестных практик продаж продуктов / услуг в физических и цифровых каналах, не отвечающих интересам клиентов. Например, подключение/закрытие продукта/услуги без ведома клиента, продажи, которые запрещены для категорий социально незащищенных и уязвимых клиентов, в том числе путем замалчивания, использования двусмысленных выражений и преувеличения информации в клиентских и презентационных материалах, в части введения клиента в заблуждение относительно тарифов, размера комиссий, двойных комиссий, реальной стоимости продукта/услуги, а также предложение продуктов и услуг со скрытыми и непрозрачными комиссиями.'
+
+Классифицируй каждое обращение из списка ниже.
+Правила:
+1. Выбери только одну метрику
+2. Выбери только номер метрики и больше ничего
+3. Не пиши пояснений
+4. Ответ должен содержать только число
+5. Если ни одна из метрик абсолютно не подходит, выдавай None
+
+Ответ должен быть строго в формате JSON (только объект с ключами-номерами).
+# Пример того, как должен выглядеть твой ответ:
+# Если я дам тебе 2 текста, верни: {{"1": "код", "2": "код"}}
+# Если я дам тебе 3 текста, верни: {{"1": "код", "2": "код", "3": "код"}}
+# Ключи (цифры) всегда начинаются с 1 для каждого нового списка текстов.
+
+Тексты для классификации:
+"""
+        for idx, text in enumerate(batch, start=1):
+            truncated_text = text[:4000] + '...' if len(text) > 4000 else text
+            batch_prompt += f"\n--- ТЕКСТ {idx} ---\n{truncated_text}\n"
+        
+        messages = [{"role": "system", "content": batch_prompt}]
+        
+        try:
+            response = def_ask_gigachat(messages)
+            json_match = re.search(r'\{.*?\}', response)
+            
+            if json_match:
+                json_str = json_match.group(0)
+                fixed_json_str = json_str.replace("None", "null")
+                try:
+                    response_json = json.loads(fixed_json_str)
+                    batch_results = []
+                    for j in range(len(batch)):
+                        batch_results.append(response_json.get(str(j+1)))
+                    results.extend(batch_results)
+                except json.JSONDecodeError as e:
+                    print(f"⚠️ Ошибка парсинга JSON: {e}")
+                    print("Текст, который вызвал ошибку:", fixed_json_str)
+                    results.extend([None] * len(batch))
+            else:
+                print("⚠️ JSON не найден в ответе. Ответ был:")
+                print(response)
+                results.extend([None] * len(batch))
+        except Exception as e:
+            print(f"⚠️ Ошибка вызова GigaChat или выполнения классификации: {e}")
+            results.extend([None] * len(batch))
+    return results
+
+
+def retrieve_hybrid_adaptive(query, faiss_idx, bm25_indexes, target_k, date_range=None):
     """Функция получает запрос пользователя и возвращает список id кандидатов (потенциально релевантных обращений)"""
-    # ищем k ближайших соседей - берем с запасом, так как потом будем фильтровать по дате (если фильтр по дате есть, то...)
-    faiss_k = 2048 if date_range else 500 # больше 2048 нельзя - фаисс gpu позволяет возвращать максимум 2048 ближайших соседей
-    bm25_k_per_shard = 300 if date_range else 200 # привязать к числу шардов (чтобы если было огромное кол-во шардов, то...)
-
-    faiss_ranks = {} # словарь типа {doc_id: rank} - ранги фаисс
+    faiss_k = 1024  # максимум к возвращаемых фаисс
+    bm25_total_k = int(faiss_k * 0.67)
+    num_shards = len(bm25_indexes)
+    bm25_k_per_shard = int(np.ceil(bm25_total_k / max(1, num_shards)))
+    date_mask = build_date_mask(date_range)
+    
+    # Поиск по faiss
+    faiss_ranks = {}
     q_emb = embed([query]).astype("float32")
-    D, I = faiss_idx.search(q_emb, min(faiss_k, faiss_idx.ntotal)) # поиск по faiss; I - индексы найденных документов,
-    # документа в выдаче; D - скор;
-    for rank, idx in enumerate(I[0], 1): # enumerate(I[0], 1) возьмет индексы (например, idx=15, idx=333, idx=72) и...
-        idx = int(idx)
-        if idx < 0 or idx >= len(doc_ids): # защита от битых индексов
-            continue
-        cid = doc_ids[idx] # cid - candidates_id - подкидываем по индексу эмбеддинга (позиция в массиве эмбеддингов...)
-        faiss_ranks[cid] = rank # записываем пару "кандидат от фаисс: его ранг"
+    if date_range is None or faiss_idx is None:
+        if faiss_idx is not None:
+            D, I = faiss_idx.search(q_emb, min(faiss_k, faiss_idx.ntotal))
+        else:
+            I = [[]]
+    else:
+        allowed_ids = np.ascontiguousarray(np.flatnonzero(date_mask).astype("int64"))
+        if len(allowed_ids) == 0:
+            return []
+        selector = faiss.IDSelectorBatch(allowed_ids)
+        params = faiss.SearchParametersIVF()
+        params.nprobe = faiss_idx.nprobe
+        params.sel = selector
+        D, I = faiss_idx.search(q_emb, min(faiss_k, len(allowed_ids)), params=params)
 
-    bm25_ranks = {} # словарь типа {doc_id: rank} - ранги bm25
+    for rank, idx in enumerate(I[0], 1):
+        idx = int(idx)
+        if idx < 0 or idx >= len(doc_ids):
+            continue
+        cid = doc_ids[idx]
+        faiss_ranks[cid] = rank
+
+    # Поиск по BM-25
+    bm25_ranks = {}
     query_tokens = tokenize(query)
-    for bm25_index, offset in bm25_indexes: # проходимся по заранее загруженным BM25 шардам; bm25_index - индекс...
-        results, scores = bm25_index.retrieve([query_tokens], k=bm25_k_per_shard) # ищем топ k документов в текущем шарде...
-        local_ids = results[0] # берем результаты для первого и единственного запроса
-        for r, lid in enumerate(local_ids, 1): # проходимся по локальным id внутри шарда; r - ранг
-            global_idx = int(lid) + offset # переводим локальный индекс шарда в глобальный индекс документа (например...
-            # ретривер же вернул локальные индексы; в shard 1 он мог вернуть local_ids = [15, 66, 2000], хотя гло...
-            # потому нужен offset: global_idx = local_idx + offset; для local_ids = 15 имеем global_idx = 15 + 500 000...
-            # пропускаем невалидные индексы
+    for bm25_index, offset in bm25_indexes:
+        shard_size = int(bm25_index.scores["num_docs"])
+        if date_range is None:
+            results, scores = bm25_index.retrieve([query_tokens], k=min(bm25_k_per_shard, shard_size))
+            local_mask = None
+        else:
+            local_mask = date_mask[offset:offset + shard_size].astype("float32")
+            allowed_count = int(local_mask.sum())
+            if allowed_count == 0:
+                continue
+            results, scores = bm25_index.retrieve([query_tokens], k=min(bm25_k_per_shard, allowed_count), weight_mask=local_mask, show_progress=False)
+        
+        for rank, local_id in enumerate(results[0], 1):
+            local_id = int(local_id)
+            if local_id < 0 or local_id >= shard_size:
+                continue
+            if local_mask is not None and local_mask[local_id] == 0:
+                continue
+            
+            global_idx = offset + local_id
             if global_idx < 0 or global_idx >= len(doc_ids):
                 continue
-            cid = doc_ids[global_idx] # получаем настоящий id обращения
-            # если документ встречался несколько раз (в шарде несколько раз один документ попался) - оставь его...
-            # в остальных случаях просто добавляем пару "кандидат от bm25 внутри текущего шарда: его ранг"
-            if cid not in bm25_ranks or r < bm25_ranks[cid]:
-                bm25_ranks[cid] = r
+            
+            cid = doc_ids[global_idx]
+            if cid not in bm25_ranks or rank < bm25_ranks[cid]:
+                bm25_ranks[cid] = rank
 
     # RRF fusion: объединяем кандидатов faiss и bm25
     all_ids = set(faiss_ranks) | set(bm25_ranks)
-    # делаем слияние фаисса и бм25: слияние рангов, а не скоров; RRF = сумма(1/(k+r(d))), где r(d) - ранг (позиция) документа в...
-    # у нас 2 слагаемых: одно по рангам faiss, другое по рангам bm25; также можем установить ALPHA важность bm25 и фаисса
-    # Если документа нет в BM25, берется ранг 999 (очень плохой ранг) - можно и 1501 взять (тк в фаисс 1500 кандидатов...)
-    # Ладно - 999 или 1500 - функция к этому моменту уже затухла
-    fused = {cid: ALPHA * (1 / (K_RRF + bm25_ranks.get(cid, 999))) +
-                  (1 - ALPHA) * (1 / (K_RRF + faiss_ranks.get(cid, 999)))
-             for cid in all_ids}
-    # полученная оценка будет от 0 до 0.0327 (при объединении двух поисковых систем) с учетом K=60;
-    sorted_cands = [cid for cid, _ in sorted(fused.items(), key=lambda x: x[1], reverse=True)] # сортируем документы по па...
+    fused = {
+        cid: ALPHA * (1 / (K_RRF + bm25_ranks.get(cid, 999))) + (1 - ALPHA) * (1 / (K_RRF + faiss_ranks.get(cid, 999)))
+        for cid in all_ids
+    }
+    sorted_cands = [cid for cid, _ in sorted(fused.items(), key=lambda x: x[1], reverse=True)]
+    return sorted_cands[:target_k]
 
-    # Фильтрация по дате
-    # Если дата не указана - возвращаем всех кандидатов; при этом здесь следующий фильтрации (первым был отбор кандидатов...)
-    # получения fusion-оценки) - берем target_k кандидатов, чтобы облегчить работу реранкеру
-    if date_range is None:
-        # return sorted_cands[:target_k]
-        return sorted_cands[:TOP_K_RERANK]
-    # faiss_k, bm25_k_per_shard - глубина первичного поиска; target_k - глубина проверки по дате после fusion
-    k_step = 300 # начальный размер окна проверки по дате; то есть будем проверять топ 300 документов, а не сразу все
-    for _ in range(4): # делаем максимум 4 итерации;
-        current_ids = sorted_cands[:k_step]
-        if not current_ids:
-            return []
-        filtered = filter_candidates_by_date(current_ids, date_range) # ищем подходящие по дате среди первых k_step
-        if len(filtered) >= target_k or k_step >= 1200: # если нашли нужное кол-во самых подходящих примеров / не дошли...
-            return filtered
-        k_step += 300
 
-    return filtered
+def load_complaints_data_from_spark(candidate_ids):
+    """
+    Loads columns 'id', 'req_desc', 'msg_pprb_chat' from HDFS Spark table
+    for the given list of candidate_ids.
+    """
+    try:
+        try:
+            from backend.api.routes.chat import get_spark_session
+            spark = get_spark_session()
+        except Exception:
+            from pyspark.sql import SparkSession
+            spark = SparkSession.builder.getOrCreate()
+        
+        if spark is None:
+            print("Spark session is not available. Cannot load complaint data.")
+            return pd.DataFrame(columns=["id", "req_desc", "msg_pprb_chat"])
+        
+        table_name = "arnsdpsbx_t_team_sva_oarb.40_kay_d3_crm_dataset_test_faiss_10kk"
+        df = spark.read.table(table_name)
+        
+        candidate_ids_str = [str(cid) for cid in candidate_ids]
+        
+        col_id = next((c for c in df.columns if c.lower() == "id"), "id")
+        col_req_desc = next((c for c in df.columns if c.lower() == "req_desc"), "req_desc")
+        col_msg_pprb_chat = next((c for c in df.columns if c.lower() == "msg_pprb_chat"), "msg_pprb_chat")
+        
+        df_filtered = df.select(col_id, col_req_desc, col_msg_pprb_chat).filter(df[col_id].isin(candidate_ids_str))
+        pandas_df = df_filtered.toPandas()
+        
+        rename_map = {col_id: "id", col_req_desc: "req_desc", col_msg_pprb_chat: "msg_pprb_chat"}
+        pandas_df = pandas_df.rename(columns=rename_map)
+        return pandas_df
+    except Exception as e:
+        print(f"Error loading complaints from Spark: {e}")
+        return pd.DataFrame(columns=["id", "req_desc", "msg_pprb_chat"])
 
 
 def rerank(query: str, candidates):
-    rerank_inputs = [(query, documents[id_to_index[cid]]) for cid in candidates] # формируем пары (запрос, документ)
-
-    raw_scores = reranker.predict(rerank_inputs, batch_size=32) # реранкер дает скоры соответствия каждой паре
+    df_spark = load_complaints_data_from_spark(candidates)
+    
+    spark_data = {}
+    for _, row in df_spark.iterrows():
+        cid_val = str(row["id"])
+        r_desc = row.get("req_desc")
+        m_chat = row.get("msg_pprb_chat")
+        spark_data[cid_val] = (
+            "" if pd.isna(r_desc) else str(r_desc),
+            "" if pd.isna(m_chat) else str(m_chat)
+        )
+    
+    rerank_inputs = []
+    for cid in candidates:
+        r_desc, m_chat = spark_data.get(str(cid), ("", ""))
+        doc_text = build_text(r_desc, m_chat)
+        rerank_inputs.append((query, doc_text))
+    
+    raw_scores = reranker.predict(rerank_inputs, batch_size=32)
     raw_scores = np.array(raw_scores)
     scores = 1 / (1 + np.exp(-raw_scores))
-
+    
     results = []
     for cid, score in zip(candidates, scores):
-        idx = id_to_index[cid]
+        idx = id_to_index.get(cid, 0)
+        r_desc, m_chat = spark_data.get(str(cid), ("", ""))
+        date_val = req_reg_dates[idx] if idx < len(req_reg_dates) else None
         results.append({
             "id": cid,
-            "Короткое описание": req_descs[idx],
-            "Транскрибация диалога": msg_pprb_chats[idx],
+            "Короткое описание": r_desc,
+            "Транскрибация диалога": m_chat,
             "score": float(score),
-            "date": req_reg_dates[idx]
-            # "text": documents[idx],
-            # "keywords": keywords
+            "date": date_val
         })
+    
     return sorted(results, key=lambda x: x["score"], reverse=True)
 
 
 def search_pipeline(query, faiss_idx, bm25_indexes, top_k=None, score_threshold=None, date_range=None):
-    target_k = top_k if top_k else DEFAULT_TOP_K # если пользователь не указал, сколько запросов он хочет получить
+    target_k = top_k if top_k else DEFAULT_TOP_K
     thr = score_threshold if score_threshold is not None else SCORE_THRESHOLD
-    candidates = retrieve_hybrid_adaptive(
-        query=query, 
-        faiss_idx=faiss_idx, 
-        bm25_indexes=bm25_indexes, 
-        target_k=target_k * 2, 
-        date_range=date_range
-    )
+    candidates_k = max(target_k * 2, TOP_K_RERANK)
+    candidates = retrieve_hybrid_adaptive(query=query, faiss_idx=faiss_idx, bm25_indexes=bm25_indexes, target_k=candidates_k, date_range=date_range)
     if not candidates:
         return pd.DataFrame()
-    reranked = rerank(query, candidates[:TOP_K_RERANK])
-
-    if top_k is not None:
-        # return pd.DataFrame(reranked[:top_k])[["id", "Короткое описание", "Транскрибация диалога", "text", "score", "key..."]]
-        return pd.DataFrame(reranked[:top_k])[["id", "Короткое описание", "Транскрибация диалога", "score", "date"]]
+    reranked = rerank(query, candidates)
     
-    # если пользователь не указал, сколько ответов вывести, выводим все релевантные (выше порога по скору)
-    filtered = [r for r in reranked if r["score"] >= thr]
+    if top_k is not None:
+        df = pd.DataFrame(reranked[:top_k])[["id", "Короткое описание", "Транскрибация диалога", "score", "date"]]
+    else:
+        filtered = [r for r in reranked if r["score"] >= thr]
+        df = pd.DataFrame(filtered if filtered else reranked[:target_k])
+    
+    if not df.empty:
+        texts = prepare_texts_for_metrics(df)
+        metrics = batch_classify_sva_metrics(texts)
+        df["Метрика СВА"] = metrics
+    else:
+        df["Метрика СВА"] = []
+        
+    columns_to_return = ["id", "Короткое описание", "Транскрибация диалога", "Метрика СВА", "score", "date"]
+    for col in columns_to_return:
+        if col not in df.columns:
+            df[col] = None
+            
+    return df[columns_to_return]
 
-    # если пользователь явно не указал, сколько ответов вывести
-    return pd.DataFrame(filtered if filtered else reranked[:target_k])[["id", "Короткое описание", "Транскрибация диалога", "score", "date"]]
-
-
-if "p_bm25_indexes" in cache:
-    print("Использую кэшированные bm25_indexes для pipeline_search...")
-    bm25_indexes = cache["p_bm25_indexes"]
-else:
-    bm25_indexes = load_bm25s_shards("/home/datalab/nfs/disrupt_tester_clean/caches/cache_1000k/bm25_shards")
-    cache["p_bm25_indexes"] = bm25_indexes
 
 MIN_DATE = "0000-01-01"
 MAX_DATE = "9999-12-31"
 
-res = search_pipeline(
-    query="не начисляется кэшбэк",
-    faiss_idx=faiss_loaded,
-    bm25_indexes=bm25_indexes,
-    top_k=100,
-    date_range=("2026-01-01", "2026-01-20")
-)
+if __name__ == "__main__":
+    res = search_pipeline(
+        query="обращения по ипотеке по графикам платежей",
+        faiss_idx=faiss_loaded,
+        bm25_indexes=bm25_indexes,
+        top_k=None,
+        date_range=("2026-01-01", MAX_DATE)
+    )

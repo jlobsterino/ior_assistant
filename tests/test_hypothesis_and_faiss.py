@@ -297,31 +297,152 @@ def test_profile_dataframe_side_by_side_mapping():
 
 
 def test_hypothesis_threshold_guard():
+    import sys
+    from unittest.mock import MagicMock
+    sys.modules['transformers'] = MagicMock()
+    sys.modules['torch'] = MagicMock()
+    
     import asyncio
     from backend.agent.hypothesis import generate_hypothesis_narrative
-    df = pd.DataFrame({
-        "incdnt_id": [101, 102, 103, 104, 105],
-        "incdnt_sum": [1000, 2000, 3000, 4000, 5000],
-        "recovery": [100, 200, 300, 400, 500],
-        "incdnt_status_name": ["Утверждение", "Утверждение", "Черновик", "Удален", "Удален"]
-    })
-    file_info = {"name": "small_test.xlsx", "size": "15 KB"}
+    import local_qwen
+    
+    # Save original
+    original_ask = local_qwen.ask_local_qwen
+    called_prompts = []
+    
+    def mock_ask_local_qwen(messages, max_tokens=4096):
+        for m in messages:
+            called_prompts.append(m["content"])
+        return "Это краткая суммаризация выборки."
+        
+    local_qwen.ask_local_qwen = mock_ask_local_qwen
+    
+    try:
+        df = pd.DataFrame({
+            "incdnt_id": [101, 102, 103, 104, 105],
+            "incdnt_sum": [1000, 2000, 3000, 4000, 5000],
+            "recovery": [100, 200, 300, 400, 500],
+            "incdnt_status_name": ["Утверждение", "Утверждение", "Черновик", "Удален", "Удален"]
+        })
+        file_info = {"name": "small_test.xlsx", "size": "15 KB"}
+        
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            report = loop.run_until_complete(
+                generate_hypothesis_narrative("Выведи гипотезы", df, file_info, "session_123")
+            )
+            assert "3 000.00 ₽" in report
+            assert "300.00 ₽" in report
+            assert "2 700.00 ₽" in report
+            assert "Это краткая суммаризация выборки." in report
+            
+            # Verify that the summarization instructions were appended to system prompt
+            system_prompt = called_prompts[0]
+            assert "размер выборки мал" in system_prompt or "НЕ ВКЛЮЧАЙ раздел" in system_prompt
+        finally:
+            loop.close()
+    finally:
+        local_qwen.ask_local_qwen = original_ask
+
+
+
+def test_grounding_morphological_variants():
+    from backend.agent.resolve.grounding import _adj_nominative_variants
+    v1 = _adj_nominative_variants("эквайринга")
+    assert "эквайринг" in v1
+    v2 = _adj_nominative_variants("обращениям")
+    assert "обращение" in v2
+
+
+
+def test_empty_dataframe_export_success():
+    import asyncio
+    from backend.agent.tools.dataframe_ops import export_excel, export_csv
+    from backend.agent.query_spec import CompileContext, compile_query_spec
+    from backend.agent.schema import get_schema
+    from datetime import date
+    
+    class MockContext:
+        def __init__(self):
+            self.dataframes = {"df_empty": pd.DataFrame(columns=["incdnt_id", "incdnt_sid"])}
+            self.dataframe_meta = {}
+            self.files = {}
+            self.emit = MagicMock()
+        def get_df(self, did):
+            return self.dataframes[did]
+        def register_dataframe(self, df, *args, **kwargs):
+            from dataclasses import dataclass
+            @dataclass
+            class DfRef:
+                df_id: str
+            return DfRef(df_id="df_empty")
+        def register_file(self, *args, **kwargs):
+            from dataclasses import dataclass
+            @dataclass
+            class FileRef:
+                file_id: str
+                name: str
+            return FileRef(file_id="file_empty", name="empty.xlsx")
+            
+    ctx = MockContext()
     
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     try:
-        report = loop.run_until_complete(
-            generate_hypothesis_narrative("Выведи гипотезы", df, file_info, "session_123")
-        )
-        assert "Всего инцидентов в файле" in report
-        assert "15 000.00 ₽" in report
-        assert "1 500.00 ₽" in report
-        assert "13 500.00 ₽" in report
-        assert "Аналитические гипотезы не формировались, так как размер выборки составляет менее 20 инцидентов" in report
-        assert "Инцидент 105" in report
-        assert "Инцидент 104" in report
+        res_ex = loop.run_until_complete(export_excel(ctx, "df_empty", "empty.xlsx"))
+        assert res_ex.ok is True
+        assert res_ex.output["file_id"] is None
+        
+        res_csv = loop.run_until_complete(export_csv(ctx, "df_empty", "empty.csv"))
+        assert res_csv.ok is True
+        assert res_csv.output["file_id"] is None
+        
+        from backend.agent.tools.registry import REGISTRY as registry
+        original_execute = registry.execute
+        async def mock_execute(tool_name, args, state):
+            from backend.agent.tools.base import ToolResult
+            if tool_name == "query":
+                return ToolResult(ok=True, output={"df_id": "df_empty"})
+            return ToolResult(ok=True)
+        registry.execute = mock_execute
+        
+        try:
+            cctx = CompileContext(ctx=ctx, emit=ctx.emit, schema=get_schema(), now=date.today())
+            spec = {
+                "source": {"table": "d6_base_of_knowledge_ior"},
+                "filters": [
+                    {"kind": "period", "column": "incdnt_entry_dt", "op": "eq", "value": "2026-03-01"}
+                ]
+            }
+            res_compile = loop.run_until_complete(compile_query_spec(cctx, spec, registry=registry))
+            assert res_compile.ok is True
+            assert res_compile.file_id is None
+        finally:
+            registry.execute = original_execute
     finally:
         loop.close()
+
+
+def test_appeals_mapping_and_where_operator_mapping():
+    from backend.data.base import build_where_clauses
+    
+    # 1. Test logical operator mapping
+    where_dict = {"incdnt_id": {"gt": 100}, "direct_loss": {"eq": 500}}
+    col_types = {"incdnt_id": "bigint", "direct_loss": "decimal"}
+    clauses = build_where_clauses(where_dict, col_types)
+    assert "incdnt_id > 100" in clauses
+    assert "direct_loss = 500" in clauses
+    
+    # 2. Test appeals (src_type_lvl_2_name = "Обращение клиента") compound mapping
+    where_appeals = {"src_type_lvl_2_name": "\u041e\u0431\u0440\u0430\u0449\u0435\u043d\u0438\u0435 \u043a\u043b\u0438\u0435\u043d\u0442\u0430"}
+    clauses_app = build_where_clauses(where_appeals, {"src_type_lvl_2_name": "string"})
+    expected_compound = (
+        "(incdnt_detection_person_name = '\u041a\u043b\u0438\u0435\u043d\u0442' "
+        "OR src_type_lvl_2_name LIKE '%\u043e\u0431\u0440\u0430\u0449\u0435\u043d\u0438%' "
+        "OR incdnt_source_name LIKE '%\u043a\u043b\u0438\u0435\u043d\u0442%')"
+    )
+    assert expected_compound in clauses_app
 
 
 if __name__ == "__main__":

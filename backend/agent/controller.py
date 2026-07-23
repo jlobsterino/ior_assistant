@@ -60,6 +60,7 @@ SYSTEM_CONTROLLER = """Ты — итеративный агент-аналити
     * Для задолженности / невозможности взыскания по кредитам -> run_preset с skill_id='credit_no_way_collect_debt_v2'.
     * Для детального досье/отчета по конкретному инциденту по его ID (например, EVE-123456) -> run_preset с skill_id='report_period_specific_ior_v2'.
     * Для общих выгрузок инцидентов ИОР за период по ПАО Сбербанк (без сужения темы) -> run_preset с skill_id='ior_period_pao_sberbank_v2'.
+  - Если запрос пользователя содержит несколько фильтров одновременно (например, статус + дата + территориальный банк, или блок + дата + возмещения), но по смыслу относится к одной из тем готовых отчетов, ты ОБЯЗАН запустить именно run_preset для соответствующего skill_id, передав все извлеченные фильтры в параметрах. Не переходи к кастомным запросам run_query_spec/run_query только из-за наличия нескольких фильтров!
   - Если ни один готовый пресет из списка выше не подходит под запрос пользователя (например, требуется сложный JOIN, специфическая группировка или кастомная фильтрация по полям, не входящим в стандартные темы), только тогда используй run_query_spec или run_query.
   - Для досье конкретного инцидента -> get_ior_details или run_preset(skill_id='report_period_specific_ior_v2').
 • ВНИМАНИЕ: Если в запросе есть даты (периоды) или деньги (потери/возмещения), для кастомных запросов используй run_query_spec (инструмент query ЗАПРЕЩЕН). Но если есть подходящий типовой отчет, всегда выбирай run_preset.
@@ -158,7 +159,7 @@ _AGG_RE = re.compile(
     r"\bс\s+каждым|по\s+процесс|по\s+тб\b|по\s+банк|распредел",
     re.IGNORECASE
 )
-_SLICE_RE = re.compile(r"выгруз|список|вывед|покажи\s+иор|инцидент", re.IGNORECASE)
+_SLICE_RE = re.compile(r"выгруз|список|вывед|покажи\s+иор|инцидент|иор\b|найди\b|найти\b", re.IGNORECASE)
 
 
 def _grounded_related(grounding) -> bool:
@@ -203,13 +204,6 @@ def route_path(user_msg: str, grounding=None, period=None) -> str:
 # ----- гард пустого df перед экспорт (§3.8, дублирует тул-гард – ранний рубеж) -----
 
 def empty_export_guard(df_id, state) -> Optional[str]:
-    from backend.agent.query_spec import is_empty_df  # offline-safe
-    if not df_id:
-        return None
-    df = state.get_df(df_id) if df_id in getattr(state, "dataframes", {}) else None
-    if is_empty_df(df):
-        return ("EMPTY_RESULT: Финальный df пуст – нечего выгружать. Проверь гард-порог/"
-                "категориальное значение/период, либо честно сообщи пользователю (ask_user).")
     return None
 
 
@@ -529,6 +523,11 @@ async def run_agent_v2(*, state, user_msg, emit=None, llm=None, registry=None,
             llm.invoke, [{"role": "system", "content": sys + salt},
                          {"role": "user", "content": ctx}]
         )
+        if raw and raw.startswith("[Ошибка LLM:"):
+            err_msg = raw.strip("[]")
+            await activity("think", "thinking", "Ошибка сервиса GigaChat", err_msg, "failed")
+            return AgentTurnResult(ok=False, ask_user=f"Произошла ошибка при обращении к языковой модели GigaChat: {err_msg}. Пожалуйста, попробуйте позже.",
+                                   files=files, history=history, **pkg)
         act, err = compile_action(parse_controller_json(raw), valid_tools)
         logger.info(f"[DEBUG_ACT] iter={it} action={act.action if act else None} err={err}")
         if err:

@@ -147,6 +147,23 @@ def gen_ior(n: int = 10_000, seed: int = 42) -> pd.DataFrame:
 
         tb_lvl_2 = random.choice(TB_NAMES)
         tb_lvl_3 = random.choice(TB_LVL_3)
+        
+        rp_name = random.choice([
+            "Информационная безопасность", "Кредитные риски",
+            "Операционная стабильность", "Регуляторные риски",
+            "Поведенческие риски",
+            "Штрафные санкции",
+        ])
+        rp_id_map = {
+            "Кредитные риски": ["DRP-10047", "DRP-10027", "DRP-10023", "DRP-10024", "DRP-10101"],
+            "Информационная безопасность": ["DRP-10008", "DRP-10012"],
+            "Операционная стабильность": ["DRP-10138", "DRP-10025"],
+            "Регуляторные риски": ["DRP-10192", "DRP-10196"],
+            "Поведенческие риски": ["DRP-10102", "DRP-10103"],
+            "Штрафные санкции": ["DRP-10050", "DRP-10051"]
+        }
+        rp_id = random.choice(rp_id_map.get(rp_name))
+
         rows.append({
             "incdnt_sid": f"EVE-{5_000_000 + i:07d}",
             "incdnt_id": 10_000_000 + i,
@@ -169,13 +186,8 @@ def gen_ior(n: int = 10_000, seed: int = 42) -> pd.DataFrame:
             "incdnt_entry_dt": entry_dt,
             "incdnt_first_validated_dttm": validated,
             "incdnt_last_validate_dttm": validated + timedelta(days=random.randint(0, 60)),
-            "risk_profile_id": f"RP-{random.randint(1, 50):03d}",
-            "risk_profile_name": random.choice([
-                "Информационная безопасность", "Кредитные риски",
-                "Операционная стабильность", "Регуляторные риски",
-                "Поведенческие риски",
-                "Штрафные санкции",
-            ]),
+            "risk_profile_id": rp_id,
+            "risk_profile_name": rp_name,
             "incdnt_client_type_name": random.choice([
                 "Физическое лицо", "Юридическое лицо",
                 "ИП", "Сотрудник банка", "Контрагент",

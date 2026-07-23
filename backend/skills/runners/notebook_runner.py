@@ -757,16 +757,44 @@ def _build_stats(skill_id: str, rows: int, data: list[dict]) -> dict:
 
     for r in data:
         tb = r.get("Орг. структура – уровень 3 (Блок / ТБ / ПЦП)") or r.get("ТБ") or ""
-        tbs.append(tb)
+        tb_str = str(tb).strip()
+        if tb_str and tb_str.lower() not in ("none", "nan", "—", "null", "уровень 3", "-"):
+            tbs.append(tb_str)
 
         type_val = r.get("Тип события – уровень 1") or r.get("Тип события - уровень 1") or ""
-        types.append(type_val)
+        type_str = str(type_val).strip()
+        if type_str and type_str.lower() not in ("none", "nan", "—", "null", "-"):
+            types.append(type_str)
 
         proc = r.get("Процесс – уровень 4 (Наименование процесса)") or r.get("Процесс") or ""
-        procs.append(proc)
+        proc_str = str(proc).strip()
+        if proc_str and proc_str.lower() not in ("none", "nan", "—", "null", "уровень 4", "-"):
+            procs.append(proc_str)
 
-        amount = r.get("Общая сумма всех последствий (руб.)") or r.get("Сумма последствий, ₽") or 0.0
-        sum_total += float(amount)
+        # Extract amount with flexible case-insensitive and spelling-tolerant lookup
+        amount = 0.0
+        k_map = {str(k).lower().strip(): val for k, val in r.items() if val is not None}
+        for cand in [
+            "общая сумма всех последствий (руб.)",
+            "общая сумма последствий (руб.)",
+            "сумма последствия (руб.)",
+            "сумма последствий (руб.)",
+            "сумма последствий, ₽",
+            "сумма последствий",
+            "сумма возмещения, ₽",
+            "сумма возмещения",
+            "incdnt_sum",
+            "recovery"
+        ]:
+            if cand in k_map:
+                amount = float(k_map[cand])
+                break
+        else:
+            for k_lower, val in k_map.items():
+                if "сумма последств" in k_lower or "сумма последствия" in k_lower or "incdnt_sum" in k_lower:
+                    amount = float(val)
+                    break
+        sum_total += amount
 
         ar = r.get("Признак авторегистрации инцидента") or r.get("Авторегистрация")
         if ar == "Y":
@@ -780,7 +808,24 @@ def _build_stats(skill_id: str, rows: int, data: list[dict]) -> dict:
     top_type_label, top_type_value = type_counter.most_common(1)[0] if types else ("", 0)
     top_proc_label, top_proc_value = proc_counter.most_common(1)[0] if procs else ("", 0)
 
-    sum_recovery = round(sum_total * random.uniform(0.18, 0.42), 2)
+    # Calculate real recovery if available, fallback to legacy random simulation otherwise
+    sum_recovery = 0.0
+    if skill_id == "financial_consequences_ior_v2":
+        sum_recovery = 0.0
+    else:
+        has_real_recovery = False
+        for r in data:
+            rec_val = r.get("Сумма возмещений (руб.)") or r.get("Сумма возмещения, ₽") or r.get("recovery_rub_amt_aggr") or r.get("recovery_rub_amt")
+            if rec_val is not None:
+                val_f = float(rec_val)
+                if val_f > 0:
+                    has_real_recovery = True
+                    sum_recovery += val_f
+
+        if not has_real_recovery:
+            sum_recovery = round(sum_total * random.uniform(0.18, 0.42), 2)
+        else:
+            sum_recovery = round(sum_recovery, 2)
 
     breakdown_type = [
         {"label": label, "value": v}
@@ -931,12 +976,24 @@ def _build_narrative(skill_id: str, params: dict, stats: dict) -> str:
             f"**{sum_loss:,.0f} ₽**.".replace(",", " ")
         )
 
+    # Build loss line (Task 16: hide recovery completely for financial_consequences_ior_v2)
+    if skill_id == "financial_consequences_ior_v2":
+        loss_line = f"Общая сумма потерь — **{sum_loss:,.0f} ₽**."
+    else:
+        loss_line = f"Общая сумма потерь — **{sum_loss:,.0f} ₽**, возмещения — **{recov:,.0f} ₽** ({recov_pct}%)."
+
+    # Build reason line (Task 13: protect against empty placeholder and false 100% single group)
+    reason_label = str(tt.get('label', '')).strip()
+    if reason_label and reason_label.lower() not in ("", "—", "nan", "none", "null", "уровень 1"):
+        reason_line = f"Основная причина — **{reason_label}** ({tt.get('pct', 0)}%)."
+    else:
+        reason_line = "Основная причина — не определена (данные по типу события отсутствуют или неполны)."
+
     return (
         f"Готова выгрузка по запросу за период **{begin} – {end}**. \n"
         f"В период попало **{rows}** инцидентов.\n"
-        f"Общая сумма потерь — **{sum_loss:,.0f} ₽**, возмещения — **{recov:,.0f} ₽** "
-        f"({recov_pct}%).\n\n"
-        f"Основная причина — **{tt.get('label','-')}** ({tt.get('pct',0)}%).\n\n"
+        f"{loss_line}\n"
+        f"{reason_line}\n\n"
         f"📁 Полная выгрузка в Excel."
     ).replace(",", " ")
 

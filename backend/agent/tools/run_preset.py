@@ -42,25 +42,31 @@ SKILL_ALLOWED_PARAMS = {
         "status_filter", "tb_filter", "block_filter", "additional_sql_filter"
     },
     "deleted_ior_v2": {
-        "incdnt_entry_dt_begin", "incdnt_entry_dt_end", "ORG_PREFIXES", "additional_sql_filter"
+        "incdnt_entry_dt_begin", "incdnt_entry_dt_end", "ORG_PREFIXES",
+        "status_filter", "tb_filter", "block_filter", "additional_sql_filter"
     },
     "financial_consequences_ior_v2": {
-        "incdnt_entry_dt_begin", "incdnt_entry_dt_end"
+        "incdnt_entry_dt_begin", "incdnt_entry_dt_end",
+        "status_filter", "tb_filter", "block_filter", "additional_sql_filter"
     },
     "vozmeshenie_ior_v2": {
-        "incdnt_entry_dt_begin", "incdnt_entry_dt_end"
+        "incdnt_entry_dt_begin", "incdnt_entry_dt_end",
+        "status_filter", "tb_filter", "block_filter", "additional_sql_filter"
     },
     "ior_nonfinancial_consequences_v2": {
-        "incdnt_entry_dt_begin", "incdnt_entry_dt_end"
+        "incdnt_entry_dt_begin", "incdnt_entry_dt_end",
+        "status_filter", "tb_filter", "block_filter", "additional_sql_filter"
     },
     "credit_no_way_collect_debt_v2": {
-        "incdnt_entry_dt_begin", "incdnt_entry_dt_end"
+        "incdnt_entry_dt_begin", "incdnt_entry_dt_end",
+        "status_filter", "tb_filter", "block_filter", "additional_sql_filter"
     },
     "report_period_specific_ior_v2": {
         "incdnt_sid"
     },
     "ior_period_pao_sberbank_v2": {
-        "incdnt_entry_dt_begin", "incdnt_entry_dt_end"
+        "incdnt_entry_dt_begin", "incdnt_entry_dt_end", "ORG_PREFIXES",
+        "status_filter", "tb_filter", "block_filter", "additional_sql_filter"
     }
 }
 
@@ -109,7 +115,7 @@ async def run_preset(ctx, skill_id: str, params: dict | None = None, emit=None) 
             except Exception:
                 params["incdnt_entry_dt_end"] = current_period.end
 
-    # 2. Выделение и нормализация фильтров оргструктуры, блоков и статусов
+    # 2. Выделение и нормализация фильтров оргструктуры, блоков, статусов и риск-профилей
     tb_val = None
     for k in ["org_struct_lvl_3_name", "tb_filter", "tb", "tb_name"]:
         if k in params:
@@ -124,6 +130,23 @@ async def run_preset(ctx, skill_id: str, params: dict | None = None, emit=None) 
     for k in ["incdnt_status_name", "status_filter", "status"]:
         if k in params:
             status_val = params.pop(k)
+
+    source_val = None
+    for k in ["src_type_lvl_2_name", "source_filter", "source"]:
+        if k in params:
+            source_val = params.pop(k)
+
+    risk_profile_val = None
+    risk_profile_col = None
+    for k in ["risk_profile_name", "risk_profile_id", "risk_profile", "profile"]:
+        if k in params:
+            risk_profile_val = params.pop(k)
+            break
+
+    process_val = None
+    for k in ["process_lvl_4_name", "process_filter", "process", "proc"]:
+        if k in params:
+            process_val = params.pop(k)
 
     # Канонизация и заземление категориальных значений через поисковый движок
     from backend.agent.resolve.value_search import search_values
@@ -154,6 +177,41 @@ async def run_preset(ctx, skill_id: str, params: dict | None = None, emit=None) 
             if hits_any:
                 status_val = hits_any[0].value
 
+    if source_val:
+        hits = search_values(str(source_val), columns=["src_type_lvl_2_name"], min_score=0.6)
+        if hits:
+            source_val = hits[0].value
+        else:
+            hits_any = search_values(str(source_val), min_score=0.6)
+            if hits_any:
+                source_val = hits_any[0].value
+
+    if risk_profile_val:
+        # Search in risk_profile_id first
+        hits_id = search_values(str(risk_profile_val), columns=["risk_profile_id"], min_score=0.6)
+        if hits_id:
+            risk_profile_val = hits_id[0].value
+            risk_profile_col = "risk_profile_id"
+        else:
+            hits_name = search_values(str(risk_profile_val), columns=["risk_profile_name"], min_score=0.6)
+            if hits_name:
+                risk_profile_val = hits_name[0].value
+                risk_profile_col = "risk_profile_name"
+            else:
+                hits_any = search_values(str(risk_profile_val), min_score=0.6)
+                if hits_any:
+                    risk_profile_val = hits_any[0].value
+                    risk_profile_col = hits_any[0].column.split(".")[-1]
+
+    if process_val:
+        hits = search_values(str(process_val), columns=["process_lvl_4_name"], min_score=0.6)
+        if hits:
+            process_val = hits[0].value
+        else:
+            hits_any = search_values(str(process_val), min_score=0.6)
+            if hits_any:
+                process_val = hits_any[0].value
+
     allowed = SKILL_ALLOWED_PARAMS.get(skill_id, set())
     
     if tb_val:
@@ -168,13 +226,54 @@ async def run_preset(ctx, skill_id: str, params: dict | None = None, emit=None) 
         elif "additional_sql_filter" in allowed:
             existing = params.get("additional_sql_filter")
             if existing:
-                params["additional_sql_filter"] = f"{existing} AND funct_block_lvl_3_name = '{block_val}'"
+                params["additional_sql_filter"] = f"({existing}) AND funct_block_lvl_3_name = '{block_val}'"
             else:
                 params["additional_sql_filter"] = f"funct_block_lvl_3_name = '{block_val}'"
             
     if status_val:
         if "status_filter" in allowed:
             params["status_filter"] = status_val
+        elif "additional_sql_filter" in allowed:
+            existing = params.get("additional_sql_filter")
+            if existing:
+                params["additional_sql_filter"] = f"({existing}) AND incdnt_status_name = '{status_val}'"
+            else:
+                params["additional_sql_filter"] = f"incdnt_status_name = '{status_val}'"
+
+    if process_val:
+        if "additional_sql_filter" in allowed:
+            existing = params.get("additional_sql_filter")
+            clause = f"process_lvl_4_name = '{process_val}'"
+            if existing:
+                params["additional_sql_filter"] = f"({existing}) AND {clause}"
+            else:
+                params["additional_sql_filter"] = clause
+
+    if source_val:
+        if "additional_sql_filter" in allowed:
+            existing = params.get("additional_sql_filter")
+            if "\u043e\u0431\u0440\u0430\u0449\u0435\u043d" in str(source_val).lower():
+                clause = (
+                    "(incdnt_detection_person_name = '\u041a\u043b\u0438\u0435\u043d\u0442' "
+                    "OR src_type_lvl_2_name LIKE '%\u043e\u0431\u0440\u0430\u0449\u0435\u043d\u0438%' "
+                    "OR incdnt_source_name LIKE '%\u043a\u043b\u0438\u0435\u043d\u0442%')"
+                )
+            else:
+                clause = f"src_type_lvl_2_name = '{source_val}'"
+            if existing:
+                params["additional_sql_filter"] = f"({existing}) AND {clause}"
+            else:
+                params["additional_sql_filter"] = clause
+
+    if risk_profile_val and risk_profile_col:
+        if risk_profile_col in allowed:
+            params[risk_profile_col] = risk_profile_val
+        elif "additional_sql_filter" in allowed:
+            existing = params.get("additional_sql_filter")
+            if existing:
+                params["additional_sql_filter"] = f"({existing}) AND {risk_profile_col} = '{risk_profile_val}'"
+            else:
+                params["additional_sql_filter"] = f"{risk_profile_col} = '{risk_profile_val}'"
 
     # Генерация SQL-подзапросов для числовых денежных фильтров при наличии money-интентов
     user_msg = ""
@@ -302,27 +401,71 @@ async def run_preset(ctx, skill_id: str, params: dict | None = None, emit=None) 
         
         # Пост-фильтрация по оргструктуре, блоку, статусу (для пресетов, не поддерживающих эти параметры напрямую в Spark)
         def filter_by_value(dataframe, col_keywords, val):
-            words = [w for w in str(val).lower().split() if w not in ("банк", "блок", "отделение", "филиал", "пао", "сбербанк", "сбер")]
-            if not words:
-                return dataframe
-            stem = words[0][:5]
+            val_lower = str(val).lower().strip()
+            col_keywords_cleaned = [kw.lower().strip() for kw in col_keywords]
+            
+            # Find all candidate columns matching the keywords
+            candidate_cols = []
             for col in dataframe.columns:
                 col_lower = str(col).lower()
-                if any(kw in col_lower for kw in col_keywords):
-                    mask = dataframe[col].astype(str).str.lower().str.contains(stem, na=False)
-                    return dataframe[mask]
+                if any(kw in col_lower for kw in col_keywords_cleaned):
+                    candidate_cols.append(col)
+                    
+            if not candidate_cols:
+                return dataframe
+                
+            # Sort candidate columns by priority (lvl 3 -> lvl 4 -> lvl 2 -> others)
+            candidate_cols = sorted(candidate_cols, key=lambda c: (
+                0 if any(x in str(c).lower() for x in ("lvl_3", "lvl3", "уровень 3", "уровень_3"))
+                else 1 if any(x in str(c).lower() for x in ("lvl_4", "lvl4", "уровень 4"))
+                else 2 if any(x in str(c).lower() for x in ("lvl_2", "lvl2", "уровень 2"))
+                else 3
+            ))
+            
+            # 1. Try exact match on any of the candidate columns in priority order
+            for col in candidate_cols:
+                mask_exact = dataframe[col].astype(str).str.lower().str.strip() == val_lower
+                filtered_df = dataframe[mask_exact]
+                if not filtered_df.empty:
+                    return filtered_df
+                    
+            # 2. Try word-level matching (excluding division/block noise words)
+            words = [w for w in val_lower.split() if w not in ("банк", "блок", "отделение", "филиал", "пао", "сбербанк", "сбер", "банка", "уровень", "дивизион")]
+            if not words:
+                return dataframe
+                
+            import re
+            patterns = [rf"\b{re.escape(w[:5])}" for w in words]
+            
+            for col in candidate_cols:
+                mask_words = dataframe[col].astype(str).str.lower().apply(
+                    lambda x: all(re.search(p, x) is not None for p in patterns)
+                )
+                filtered_df = dataframe[mask_words]
+                if not filtered_df.empty:
+                    return filtered_df
+                    
             return dataframe
 
         original_len = len(df)
         
-        if tb_val and "tb_filter" not in allowed and "additional_sql_filter" not in allowed:
-            df = filter_by_value(df, ["tb", "bank", "орг", "org_struct_lvl_3_name", "территориальный"], tb_val)
+        if tb_val:
+            df = filter_by_value(df, ["tb", "bank", "орг", "org_struct_lvl_3_name", "территориальный", "тб"], tb_val)
             
-        if block_val and "block_filter" not in allowed and "additional_sql_filter" not in allowed:
+        if block_val:
             df = filter_by_value(df, ["block", "блок", "funct_block", "направление"], block_val)
             
-        if status_val and "status_filter" not in allowed:
+        if status_val:
             df = filter_by_value(df, ["status", "статус", "stts"], status_val)
+
+        if process_val:
+            df = filter_by_value(df, ["process", "процесс", "proc"], process_val)
+
+        if source_val:
+            df = filter_by_value(df, ["source", "источник", "src"], source_val)
+
+        if risk_profile_val:
+            df = filter_by_value(df, ["risk_profile", "профиль", "profile"], risk_profile_val)
 
         # Очищаем все денежные колонки и превращаем их в float
         money_cols = []
@@ -387,11 +530,18 @@ async def run_preset(ctx, skill_id: str, params: dict | None = None, emit=None) 
         # Стандартизация названий колонок
         rename_dict = {}
         for col in df.columns:
+            # Check if the column is already in Cyrillic
+            if any(u'\u0400' <= char <= u'\u04FF' for char in str(col)):
+                continue
+                
             col_lower = str(col).lower()
             if any(x in col_lower for x in ("incdnt_sum", "общая сумма", "сумма последствий")) and not any(x in col_lower for x in ("rec", "возмещ", "возврат")):
                 rename_dict[col] = "Общая сумма последствий (руб.)"
-            elif any(x in col_lower for x in ("recovery", "возмещ", "возврат")):
+            elif any(x in col_lower for x in ("recovery_rub_amt", "recovery_amt", "сумма возмещен")):
                 rename_dict[col] = "Сумма возмещений (руб.)"
+            elif any(x in col_lower for x in ("recovery", "возмещ", "возврат")):
+                if any(x in col_lower for x in ("amt", "sum", "сумма")) and not any(y in col_lower for y in ("id", "sid", "key", "code", "код", "num", "номер", "dt", "dttm", "date", "дата", "type", "тип", "account", "счет", "счёт", "doc", "документ")):
+                    rename_dict[col] = "Сумма возмещений (руб.)"
         if rename_dict:
             df = df.rename(columns=rename_dict)
                         
@@ -400,6 +550,21 @@ async def run_preset(ctx, skill_id: str, params: dict | None = None, emit=None) 
         sorted_cols = reorder_columns(df_cols)
         if sorted_cols != df_cols:
             df = df[sorted_cols]
+
+        # Recalculate stats and narrative if local pandas filters shrank the dataframe
+        if len(df) != original_len:
+            try:
+                from backend.skills.runners.notebook_runner import _build_stats, _build_narrative
+                data_list = df.to_dict(orient="records")
+                new_stats = _build_stats(skill_id, len(df), data_list)
+                if result.stats:
+                    new_stats["duration_ms"] = result.stats.get("duration_ms", 0)
+                new_narrative = _build_narrative(skill_id, params, new_stats)
+                result.text = new_narrative
+                result.stats = new_stats
+                logger.info("[run_preset] Recalculated narrative and stats for filtered DataFrame (%d rows)", len(df))
+            except Exception as re_err:
+                logger.warning("[run_preset] failed to rebuild narrative after filtering: %s", re_err)
             
         df.to_excel(result.excel_path, index=False, engine="openpyxl")
         result.rows = len(df)
@@ -468,13 +633,12 @@ REGISTRY.register(Tool(
             "params": {
                 "type": "object",
                 "description": (
-                    "Параметры скрипта. Для period-скриптов: "
-                    "{'incdnt_entry_dt_begin': 'YYYY-MM-DD', "
-                    "'incdnt_entry_dt_end': 'YYYY-MM-DD'}. "
-                    "Для ior_hypothesis_v2: {'incdnt_entry_dt_begin': 'YYYY-MM-DD', "
-                    "'incdnt_entry_dt_end': 'YYYY-MM-DD', 'status_filter': '...', 'tb_filter': '...', 'block_filter': '...'}. "
-                    "Для report_specific: {'incdnt_sid': 'EVE-NNNNNNN'}. "
-                    "Опционально: filters, org_prefixes."
+                    "Параметры скрипта. Для любого готового отчета (preset) вы можете передать "
+                    "фильтры в params: 'tb_filter' (территориальный банк, например 'Московский банк'), "
+                    "'block_filter' (функциональный блок, например 'Блок Риски'), "
+                    "'status_filter' (статус, например 'Удален' или 'Утвержден'), "
+                    "а также 'incdnt_entry_dt_begin' / 'incdnt_entry_dt_end' (период дат). "
+                    "Для report_specific передавайте {'incdnt_sid': 'EVE-NNNNNNN'}."
                 ),
             },
         },

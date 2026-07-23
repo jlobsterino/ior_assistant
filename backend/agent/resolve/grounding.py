@@ -147,8 +147,8 @@ GROUND_STRONG = _GROUND_STRONG
 _CODE_MIN = 0.6         # для кодов (префикс длинного значения) скор ниже – ок,
                         # но дополнительно требуем префиксное совпадение значения
 
-# коды процессов/событий: П1227, Р12, EVE-5092355
-_CODE_RE = re.compile(r"\b(?:[Пп]\d{2,}|EVE-\d+)\b")
+# коды процессов/событий: П1227, Р12, EVE-5092355, DRP-10047, RP-001
+_CODE_RE = re.compile(r"\b(?:[Пп]\d{2,}|EVE-\d+|[Dd][Rr][Pp]-\d+|[Rr][Pp]-\d+)\b")
 # фразы в кавычках (« », " ")
 _QUOTED_RE = re.compile(r"['\"«“]([^'\"»”]{2,})['\"»”]")
 # последовательность слов с Заглавной, допускает дефис: «Волго-Вятский банк»
@@ -201,6 +201,27 @@ def _adj_nominative_variants(word: str) -> list[str]:
         fixed_parts.append(cand)
     if changed:
         variants.add("-".join(fixed_parts))
+
+    # Существительные (эквайринга -> эквайринг, обращениям -> обращение)
+    # Простые окончания существительных:
+    noun_endings = (
+        "иями", "иям", "иях", "ями", "ами", "ям", "ам", "ях", "ах", 
+        "ием", "ей", "ов", "ом", "ем", "ию", "ии", "ия", "ие", "ы", "и", "а", "я", "у", "ю", "е"
+    )
+    low_w = word.lower()
+    for end in sorted(noun_endings, key=len, reverse=True):
+        if low_w.endswith(end) and len(low_w) - len(end) >= 3:
+            stem = word[:-len(end)]
+            # Добавим чистый стем (для мужского рода: эквайринг, банк, департамент)
+            variants.add(stem)
+            # Добавим варианты с типичными окончаниями среднего/женского рода
+            variants.add(stem + "о")
+            variants.add(stem + "е")
+            variants.add(stem + "а")
+            variants.add(stem + "ие")
+            variants.add(stem + "ия")
+            break
+
     return list(variants)
 
 
@@ -250,7 +271,7 @@ def _extract_phrases(user_query: str) -> list[str]:
         add(m.group(0))
 
     # 6) отдельные значимые слова + морфо-варианты именительного
-    for w in re.findall(r"[А-ЯЁа-яёЁ-]+|[Пп]\d{2,}|EVE-\d+", user_query):
+    for w in re.findall(r"[А-ЯЁа-яёЁ-]+|[Пп]\d{2,}|EVE-\d+|[Dd][Rr][Pp]-\d+|[Rr][Pp]-\d+", user_query):
         add(w)
         for v in _adj_nominative_variants(w):
             add(v)

@@ -18,7 +18,9 @@ def call_qwen_isolated(system_prompt, user_message, max_tokens = 50):
             json = {
                 "system_prompt": system_prompt,
                 "user_message": user_message,
-                "max_tokens": max_tokens
+                "max_tokens": max_tokens,
+                "repetition_penalty": 1.2,
+                "no_repeat_ngram_size": 4
             },
             timeout = 180
         )
@@ -27,7 +29,7 @@ def call_qwen_isolated(system_prompt, user_message, max_tokens = 50):
         print(f"[RAW_RESPONSE] {repr(resp.text[:500])}", file=sys.stderr)
         return resp.json()["result"]
     except Exception as e:
-        return f"{{'ERROR': {e}}}"
+        return json.dumps({"ERROR": str(e)})
     return None
 
 def ask_local_qwen(messages: list, max_tokens: int = 4096) -> str:
@@ -324,50 +326,6 @@ def answer_detail_with_qwen(user_query: str, ior_texts: str, history: list = Non
         ]
         
     return ask_local_qwen(messages, max_tokens=1500)
-
-def extract_search_params(message: str) -> dict:
-    try:
-        response_text = ask_local_qwen([
-            {"role": "system", "content": SYSTEM_PROMPT_TEMPLATE},
-            {"role": "user", "content": message}
-        ])
-        
-        print(f"Ответ LLM: {repr(response_text)}")
-        
-        cleaned_text = response_text.replace('\ufeff', '')
-        
-        cleaned_text = re.sub(r'[\u200b\u200c\u200d\u200e\u200f\u202a-\u202e\u2066-\u2069]', '', cleaned_text)
-        
-        cleaned_text = response_text.replace(': None', ': null')
-        cleaned_text = response_text.replace(':None', ':null')
-        cleaned_text = response_text.replace(', None', ', null')
-        
-        json_match = re.search(r'\{.*?\}', cleaned_text, re.DOTALL)
-        
-        if not json_match:
-            raise ValueError("JSON не найден в ответе LLM")
-            
-        params = json.loads(json_match.group(0))
-        
-        query = params.get("query") or message
-        
-        top_k = params.get("top_k")
-        if isinstance(top_k, str):
-            if top_k.isdigit():
-                top_k = int(top_k)
-            elif top_k.lower() in ["none", "null"]:
-                top_k = None
-                
-        date_range = params.get("date_range")
-        
-        return {
-            "query": query,
-            "top_k": top_k,
-            "date_range": date_range
-        }
-    except Exception as e:
-        print(f"Ошибка при извлечении параметров: {e}")
-        return {"query": message, "top_k": None, "date_range": None}
 
 def answer_follow_up_with_qwen(user_query: str, descriptions: list, history: list = None) -> str:
     import logging

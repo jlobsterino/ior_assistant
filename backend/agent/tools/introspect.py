@@ -112,6 +112,14 @@ async def distinct_values(ctx, table: str, column: str, contains: Optional[str] 
     `contains` — отфильтровать значения по подстроке (регистронезависимо).
     Для high-card колонок (процессы ~89б) обязательно задавай contains.
     """
+    try:
+        limit_val = int(limit)
+        if limit_val <= 0:
+            limit_val = 50
+        limit = limit_val
+    except (TypeError, ValueError):
+        limit = 50
+
     store = get_data_store()
     try:
         fetch_n = max(int(limit) * 4, 200) if contains else int(limit)

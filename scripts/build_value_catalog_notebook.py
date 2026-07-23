@@ -73,7 +73,7 @@ CATEGORICAL = {
         # продукты (Событие)
         "clntpth_lvl_4_name",
         # риск-профиль и типы
-        "risk_profile_name",
+        "risk_profile_id", "risk_profile_name",
         "incdnt_type_lvl_1_name", "incdnt_type_lvl_2_name",
         "incdnt_status_name",
         "src_type_lvl_1_name", "src_type_lvl_2_name",

@@ -204,11 +204,14 @@ async def query(ctx, table: str, where: Optional[dict] = None,
         order_by = order_by[1:]
         order_desc = False
 
-    # LLM иногда передаёт limit=null или вообще не передаёт - фоллбэк на default
+    # LLM иногда передаёт limit=null, 0 или вообще не передаёт - фоллбэк на default
     if limit is None:
         limit = _MAX_ROWS_DEFAULT
     try:
-        limit = min(int(limit), _MAX_ROWS_HARD)
+        limit_val = int(limit)
+        if limit_val <= 0:
+            limit_val = _MAX_ROWS_DEFAULT
+        limit = min(limit_val, _MAX_ROWS_HARD)
     except (TypeError, ValueError):
         limit = _MAX_ROWS_DEFAULT
 
@@ -636,10 +639,11 @@ async def export_excel(ctx, df_id: str,
     # —— ГАРД пустого финального df (§3.8) — В САМОМ НАЧАЛЕ, до get_settings/sanucu —
     from backend.agent.query_spec import is_empty_df  # Lazy: pydantic-safe import
     if is_empty_df(df):
-        return ToolResult(ok=False, error=(
-            "EMPTY_RESULT: после фильтров/агрегата строк не осталось — нечего "
-            "выгружать. Проверь range-порог / категориальное значение / период, "
-            "либо честно сообщи пользователю. (df пуст)"))
+        return ToolResult(
+            ok=True,
+            output={"file_id": None, "name": None, "rows": 0, "columns": len(df.columns), "size_bytes": 0, "size": "0 B", "sample": [], "sample_headers": sorted_cols},
+            summary="Выгрузка пуста (0 строк)"
+        )
     cfg = get_settings()
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     filename = name or f"agent_{df_id}_{ts}.xlsx"
@@ -730,13 +734,106 @@ def _normalize_df_for_excel(df):
                         pass
 
     # Стандартизация названий колонок в результирующем Excel
+    CYRILLIC_RENAME = {
+        'incdnt_id': 'Идентификационный ключ инцидента операционного риска',
+        'incdnt_sid': 'Идентификатор события',
+        'incdnt_status_name': 'Статус события',
+        'incdnt_autoreg_flag': 'Признак авторегистрации инцидента',
+        'incdnt_detection_person_name': 'Кем выявлено событие',
+        'incdnt_source_name': 'Название источника',
+        'src_type_lvl_1_name': 'Тип источника инцидента (уровень 1)',
+        'src_type_lvl_2_name': 'Тип источника инцидента (уровень 2)',
+        'incdnt_type_lvl_1_name': 'Тип события – уровень 1',
+        'incdnt_type_lvl_2_name': 'Тип события – уровень 2',
+        'incdnt_detection_dt': 'Дата обнаружения (Событие)',
+        'incdnt_start_dt': 'Дата начала инцидента операционного риска',
+        'incdnt_entry_dt': 'Дата ввода (Событие)',
+        'incdnt_first_validated_dttm': 'Дата первого подтверждения',
+        'incdnt_last_validate_dttm': 'Дата последнего подтверждения',
+        'risk_profile_id': 'Идентификатор профиля риска',
+        'risk_profile_name': 'Наименование профиля риска',
+        'incdnt_client_type_name': 'Тип клиента',
+        'incdnt_mistake_cnt': 'Количество ошибок',
+        'incdnt_appl_num': 'Номер заявки',
+        'incdnt_agr_num': 'Номер договора',
+        'incdnt_agr_sid': 'Идентификатор договора',
+        'incdnt_summary_descr_txt': 'Предварительное описание',
+        'incdnt_full_descr_txt': 'Подробное описание',
+        'org_struct_id': 'Идентификатор оргструктуры',
+        'org_struct_lvl_2_name': 'Орг. структура – уровень 2 (Терр. структура / Департамент ДЗО)',
+        'org_struct_lvl_3_name': 'Орг. структура – уровень 3 (Блок / ТБ / ПЦП)',
+        'org_struct_lvl_4_name': 'Орг. структура – уровень 4 (Дивизион / Департамент)',
+        'org_struct_lvl_5_name': 'Орг. структура – уровень 5',
+        'org_struct_lvl_6_name': 'Орг. структура – уровень 6',
+        'org_struct_lvl_7_name': 'Орг. структура – уровень 7',
+        'org_struct_lvl_8_name': 'Орг. структура – уровень 8',
+        'org_struct_lvl_9_name': 'Орг. структура – уровень 9',
+        'org_struct_lvl_10_name': 'Орг. структура – уровень 10',
+        'funct_block_id': 'Идентификатор функционального блока',
+        'funct_block_lvl_2_name': 'Функциональный блок – уровень 2',
+        'funct_block_lvl_3_name': 'Функциональный блок – уровень 3',
+        'funct_block_lvl_4_name': 'Функциональный блок – уровень 4',
+        'process_lvl_1_name': 'Процесс – уровень 1',
+        'process_lvl_2_name': 'Процесс – уровень 2',
+        'process_lvl_3_name': 'Процесс – уровень 3',
+        'process_lvl_4_name': 'Процесс – уровень 4 (Наименование процесса)',
+        'clntpth_lvl_4_name': 'Клиентский путь – уровень 4',
+        'busn_area_id': 'Идентификационный ключ направления деятельности',
+        'busn_area_lvl_1_name': 'Направление деятельности банка',
+        'busn_area_lvl_2_name': 'Поднаправление деятельности банка',
+        'incdnt_security_risk_flag': 'Связь с ИБ-риском',
+        'incdnt_infrmtn_sys_risk_flag': 'Связь с риском информационных систем',
+        'incdnt_behavior_risk_flag': 'Связь с поведенческим риском',
+        'incdnt_model_risk_flag': 'Связь с модельным риском',
+        'incdnt_sum': 'Общая сумма всех последствий (руб.)',
+        'incdnt_drct_dmg_sum': 'Прямая потеря – итого (руб.)',
+        'incdnt_drct_dmg_cred_rub_amt': 'Прямая потеря – с кредитным риском (руб.)',
+        'incdnt_drct_dmg_noncred_rub_amt': 'Прямая потеря – без кредитного риска (руб.)',
+        'incdnt_indrct_dmg_sum': 'Косвенная потеря – итого (руб.)',
+        'incdnt_indrct_dmg_cred_rub_amt': 'Косвенная потеря – с кредитным риском (руб.)',
+        'incdnt_indrct_dmg_noncred_rub_amt': 'Косвенная потеря – без кредитного риска (руб.)',
+        'incdnt_unrlzd_dmg_sum': 'Нереализовавшаяся потеря – итого (руб.)',
+        'incdnt_unrlzd_dmg_cred_rub_amt': 'Нереализовавшаяся потеря – с кредитным риском (руб.)',
+        'incdnt_unrlzd_dmg_noncred_rub_amt': 'Нереализовавшаяся потеря – без кредитного риска (руб.)',
+        'incdnt_thrd_prt_sum': 'Потеря третьих лиц – итого (руб.)',
+        'incdnt_thrd_prt_cred_rub_amt': 'Потеря третьих лиц – с кредитным риском (руб.)',
+        'incdnt_thrd_prt_noncred_rub_amt': 'Потеря третьих лиц – без кредитного риска (руб.)',
+        'incdnt_gain_sum': 'Прибыль – итого (руб.)',
+        'incdnt_gain_cred_rub_amt': 'Прибыль – с кредитным риском (руб.)',
+        'incdnt_gain_noncred_rub_amt': 'Прибыль – без кредитного риска (руб.)',
+        'recovery_rub_amt_aggr': 'Возмещение – итого по инциденту (руб.)',
+        'fin_impact_id': 'Идентификатор фин. последствия (ключ)',
+        'fin_impact_sid': 'Идентификатор фин. последствия (бизнес)',
+        'fin_impact_kind_name': 'Вид финансового последствия',
+        'fin_impact_rub_amt': 'Сумма последствия (руб.)',
+        'fin_impact_ccy_amt': 'Сумма последствия (в валюте)',
+        'fin_impact_local_ccy_amt': 'Сумма последствия (в локальной валюте)',
+        'fin_impact_crncy_code': 'Код валюты последствия',
+        'fin_impact_local_crncy_code': 'Код локальной валюты последствия',
+        'fin_impact_monitoring_flag': 'Требует мониторинга (Последствие)',
+        'fin_impact_detection_dt': 'Дата обнаружения (Последствие)',
+        'fin_impact_creation_dttm': 'Дата создания (Последствие)',
+        'fin_impact_reg_dt': 'Дата регистрации в учёте',
+        'recovery_type_name': 'Тип возмещения',
+        'recovery_rub_amt': 'Сумма возмещения (руб.)',
+        'nonfin_impact_kind_name': 'Вид качественной потери'
+    }
+
     rename_dict = {}
     for col in out.columns:
-        col_lower = str(col).lower()
-        if any(x in col_lower for x in ("incdnt_sum", "общая сумма", "сумма последствий")) and not any(x in col_lower for x in ("rec", "возмещ", "возврат")):
-            rename_dict[col] = "Общая сумма последствий (руб.)"
-        elif any(x in col_lower for x in ("recovery", "возмещ", "возврат")):
-            rename_dict[col] = "Сумма возмещений (руб.)"
+        # Check if the column is already in Cyrillic
+        if any(u'\u0400' <= char <= u'\u04FF' for char in str(col)):
+            continue
+            
+        col_str = str(col).strip().lower()
+        if col_str in CYRILLIC_RENAME:
+            rename_dict[col] = CYRILLIC_RENAME[col_str]
+        else:
+            if any(x in col_str for x in ("incdnt_sum", "общая сумма", "сумма последствий")) and not any(x in col_str for x in ("rec", "возмещ", "возврат")):
+                rename_dict[col] = "Общая сумма последствий (руб.)"
+            elif any(x in col_str for x in ("recovery", "возмещ", "возврат")):
+                if any(x in col_str for x in ("amt", "sum", "сумма")) and not any(y in col_str for y in ("id", "sid", "key", "code", "код", "num", "номер", "dt", "dttm", "date", "дата", "type", "тип", "account", "счет", "счёт", "doc", "документ")):
+                    rename_dict[col] = "Сумма возмещений (руб.)"
     if rename_dict:
         out = out.rename(columns=rename_dict)
 
@@ -851,10 +948,11 @@ async def export_csv(ctx, df_id: str, name: Optional[str] = None) -> ToolResult:
     # —— ГАРД пустого финального df (§3.8) — В САМОМ НАЧАЛЕ —
     from backend.agent.query_spec import is_empty_df  # lazy: pydantic-safe import
     if is_empty_df(df):
-        return ToolResult(ok=False, error=(
-            "EMPTY_RESULT: после фильтров/агрегата строк не осталось — нечего "
-            "выгружать. Проверь range-порог / категориальное значение / период, "
-            "либо честно сообщи пользователю. (df пуст)"))
+        return ToolResult(
+            ok=True,
+            output={"file_id": None, "name": None, "rows": 0, "columns": len(df.columns), "size_bytes": 0, "size": "0 B", "sample": [], "sample_headers": sorted_cols},
+            summary="Выгрузка пуста (0 строк)"
+        )
     cfg = get_settings()
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     filename = name or f"agent_{df_id}_{ts}.csv"
@@ -922,15 +1020,32 @@ async def get_ior_details(ctx, incdnt_sid: str) -> ToolResult:
     except Exception as e:  # noqa: BLE001
         return ToolResult(ok=False, error=f"related query упал: {e}")
 
-    df_main = ctx.register_dataframe(main_df, f"main по {incdnt_sid}",
+    df_stts = ctx.register_dataframe(stts_df, f"история статусов {incdnt_sid}",
                                      "get_ior_details").df_id
+    df_nonfin = ctx.register_dataframe(nonfin_df, f"nonfin по {incdnt_sid}",
+                                       "get_ior_details").df_id
     df_rec = ctx.register_dataframe(rec_df, f"возмещения по {incdnt_sid}",
                                     "get_ior_details").df_id
     df_fin = ctx.register_dataframe(fin_df, f"fin_impact по {incdnt_sid}",
                                     "get_ior_details").df_id
-    df_nonfin = ctx.register_dataframe(nonfin_df, f"nonfin по {incdnt_sid}",
-                                       "get_ior_details").df_id
-    df_stts = ctx.register_dataframe(stts_df, f"история статусов {incdnt_sid}",
+
+    # Join main_df, fin_df, rec_df to build a complete dossier DataFrame
+    dossier_df = main_df.copy()
+    if not fin_df.empty:
+        fin_cols_rename = {c: f"fin_impact_{c}" for c in fin_df.columns if c not in ("incdnt_id", "fi_incdnt_id")}
+        fin_df_renamed = fin_df.rename(columns=fin_cols_rename)
+        join_col = "incdnt_id" if "incdnt_id" in fin_df_renamed.columns else ("fi_incdnt_id" if "fi_incdnt_id" in fin_df_renamed.columns else None)
+        if join_col:
+            dossier_df = pd.merge(dossier_df, fin_df_renamed, left_on="incdnt_id", right_on=join_col, how="left")
+            
+    if not rec_df.empty:
+        rec_cols_rename = {c: f"recovery_{c}" for c in rec_df.columns if c not in ("incdnt_id", "r_incdnt_id")}
+        rec_df_renamed = rec_df.rename(columns=rec_cols_rename)
+        join_col = "incdnt_id" if "incdnt_id" in rec_df_renamed.columns else ("r_incdnt_id" if "r_incdnt_id" in rec_df_renamed.columns else None)
+        if join_col:
+            dossier_df = pd.merge(dossier_df, rec_df_renamed, left_on="incdnt_id", right_on=join_col, how="left")
+
+    df_main = ctx.register_dataframe(dossier_df, f"досье по {incdnt_sid}",
                                      "get_ior_details").df_id
 
     return ToolResult(

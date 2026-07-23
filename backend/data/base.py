@@ -118,7 +118,7 @@ def sql_value(v: Any, col_type: str = "string") -> str:
         return "NULL"
     t = col_type.lower()
     if "date" in t or "timestamp" in t:
-        return f"TIMESTAMP '{v}'"
+        return "'" + str(v).replace("'", "''") + "'"
     if isinstance(v, str) or "string" in t or "varchar" in t:
         return "'" + str(v).replace("'", "''") + "'"
     return str(v)
@@ -129,8 +129,23 @@ def build_where_clauses(
 ) -> list[str]:
     """Превращает normalized where в SQL predicates."""
     clauses: list[str] = []
+    op_map = {
+        "gt": ">", "gte": ">=", "lt": "<", "lte": "<=", "ne": "!=", "eq": "=",
+        "like": "like", "in": "in", "is": "is"
+    }
     for col, op, val in normalize_where(where):
+        op = op_map.get(op.lower(), op)
         col_type = col_types.get(col, "string")
+        
+        # Специальный маппинг для обращений клиентов (Раздел 11.5 ИОР_mapping_разделы.md)
+        if col == "src_type_lvl_2_name" and isinstance(val, str) and "\u043e\u0431\u0440\u0430\u0449\u0435\u043d" in val.lower():
+            clauses.append(
+                "(incdnt_detection_person_name = '\u041a\u043b\u0438\u0435\u043d\u0442' "
+                "OR src_type_lvl_2_name LIKE '%\u043e\u0431\u0440\u0430\u0449\u0435\u043d\u0438%' "
+                "OR incdnt_source_name LIKE '%\u043a\u043b\u0438\u0435\u043d\u0442%')"
+            )
+            continue
+
         if op == "in":
             vals = ", ".join(sql_value(v, col_type) for v in val)
             clauses.append(f"{col} IN ({vals})")

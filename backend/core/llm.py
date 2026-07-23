@@ -113,10 +113,10 @@ class GigaChatService:
             _wait_rate_limit(self.cfg.gigachat_delay_sec)
             try:
                 resp = self._client.post(self._chat_url, json=payload)
-                if resp.status_code == 429:
+                if resp.status_code in (429, 500, 502, 503, 504):
                     if attempt < retries - 1:
-                        logger.warning("[LLM] Получен ответ 429 Too Many Requests. Попытка %d из %d. Ожидание %.1f сек...",
-                                       attempt + 1, retries, backoff)
+                        logger.warning("[LLM] Получен ответ %d. Попытка %d из %d. Ожидание %.1f сек...",
+                                       resp.status_code, attempt + 1, retries, backoff)
                         time.sleep(backoff)
                         backoff *= 2.0
                         continue
@@ -134,9 +134,9 @@ class GigaChatService:
                                json.dumps(data, ensure_ascii=False)[:300])
                 return ""
             except httpx.HTTPStatusError as status_err:
-                if status_err.response.status_code == 429 and attempt < retries - 1:
-                    logger.warning("[LLM] HTTPStatusError 429. Попытка %d из %d. Ожидание %.1f сек...",
-                                   attempt + 1, retries, backoff)
+                if status_err.response.status_code in (429, 500, 502, 503, 504) and attempt < retries - 1:
+                    logger.warning("[LLM] HTTPStatusError %d. Попытка %d из %d. Ожидание %.1f сек...",
+                                   status_err.response.status_code, attempt + 1, retries, backoff)
                     time.sleep(backoff)
                     backoff *= 2.0
                     continue

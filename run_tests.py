@@ -42,4 +42,16 @@ print("Passed test_run_preset_async_emit")
 t.test_run_preset_period_mapping()
 print("Passed test_run_preset_period_mapping")
 
+t.test_hypothesis_threshold_guard()
+print("Passed test_hypothesis_threshold_guard")
+
+t.test_grounding_morphological_variants()
+print("Passed test_grounding_morphological_variants")
+
+t.test_empty_dataframe_export_success()
+print("Passed test_empty_dataframe_export_success")
+
+t.test_appeals_mapping_and_where_operator_mapping()
+print("Passed test_appeals_mapping_and_where_operator_mapping")
+
 print("ALL TESTS OK!")

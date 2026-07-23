@@ -101,7 +101,11 @@ def _inspect_pandas(xlsx_path: Path, *, sheet_name: str = "Отчет_ОпРис
         or _find_col(cols, "process_lvl_4")
     col_amount = _find_col(cols, "Общая сумма", "последств") \
         or _find_col(cols, "Сумма последствий") \
-        or _find_col(cols, "incdnt_sum")
+        or _find_col(cols, "сумма последствия") \
+        or _find_col(cols, "сумма последств") \
+        or _find_col(cols, "incdnt_sum") \
+        or _find_col(cols, "Сумма возмещения") \
+        or _find_col(cols, "recovery")
     col_recovery = _find_col(cols, "Возмещение") or _find_col(cols, "recovery_rub_amt_aggr")
     col_autoreg = _find_col(cols, "авторегистр")
 

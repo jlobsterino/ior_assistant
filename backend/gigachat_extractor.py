@@ -197,4 +197,45 @@ def def_summarize_complaints(topic: str, descriptions: list[str],
         print(f"Ошибка саммаризации: {e}")
         return ""
 
-summarize_complaints = def_summarize_complaints
+summarize_complaints = def_summarize_complaints
+
+
+def extract_search_params(message: str) -> dict:
+    try:
+        response_text = def_ask_gigachat([
+            {"role": "system", "content": SYSTEM_PROMPT_TEMPLATE},
+            {"role": "user", "content": message}
+        ])
+        
+        print(f"Ответ LLM: {repr(response_text)}")
+        
+        cleaned_text = response_text.replace('\ufeff', '')
+        cleaned_text = re.sub(r'[\u200b\u200c\u200d\u200e\u200f\u202a-\u202e\u2066-\u2069]', '', cleaned_text)
+        cleaned_text = cleaned_text.replace(': None', ': null')
+        cleaned_text = cleaned_text.replace(':None', ':null')
+        cleaned_text = cleaned_text.replace(', None', ', null')
+        
+        json_match = re.search(r'\{.*?\}', cleaned_text, re.DOTALL)
+        if not json_match:
+            raise ValueError("JSON не найден в ответе LLM")
+            
+        params = json.loads(json_match.group(0))
+        query = params.get("query") or message
+        
+        top_k = params.get("top_k")
+        if isinstance(top_k, str):
+            if top_k.isdigit():
+                top_k = int(top_k)
+            elif top_k.lower() in ["none", "null"]:
+                top_k = None
+                
+        date_range = params.get("date_range")
+        return {
+            "query": query,
+            "top_k": top_k,
+            "date_range": date_range
+        }
+    except Exception as e:
+        print(f"Ошибка при извлечении параметров через GigaChat: {e}")
+        return {"query": message, "top_k": None, "date_range": None}
+
